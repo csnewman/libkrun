@@ -1683,6 +1683,36 @@
           "ffi_name": "krun_vmm_builder_shutdown_support"
         },
         {
+          "name": "restore",
+          "doc": [
+            " Restore the VM from a snapshot that [`VmmHandle::snapshot`] wrote into",
+            " `dir`, rather than boot it.",
+            "",
+            " The VM must be configured as the one the snapshot was taken of: the",
+            " same vCPUs, memory and payload, and the same devices in the same order.",
+            " Its devices may use other file descriptors and sockets. Supported on",
+            " Linux."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "dir",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_restore"
+        },
+        {
           "name": "build",
           "receiver": "value",
           "params": [],
@@ -1773,6 +1803,31 @@
             "c_convention": "out_param"
           },
           "ffi_name": "krun_vmm_handle_resume"
+        },
+        {
+          "name": "snapshot",
+          "doc": [
+            " Pause the VM and write a snapshot of it into the directory `dir`, which",
+            " [`VmmBuilder::restore`] starts a VM from. The VM stays paused:",
+            " [`VmmHandle::resume`] carries on from where it was. Must not be called",
+            " from the thread running [`Vmm::run`]. Supported on Linux."
+          ],
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "dir",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_handle_snapshot"
         },
         {
           "name": "shutdown",

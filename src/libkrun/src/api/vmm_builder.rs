@@ -1,6 +1,8 @@
 use std::marker::PhantomData;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -36,6 +38,7 @@ pub struct VmmBuilder<'a> {
     acpi: bool,
     smbios_oem_strings: Vec<String>,
     shutdown_support: bool,
+    restore: Option<String>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -155,6 +158,21 @@ impl<'a> VmmBuilder<'a> {
         self
     }
 
+    /// Restore the VM from a snapshot that [`VmmHandle::snapshot`] wrote into
+    /// `dir`, rather than boot it.
+    ///
+    /// The VM must be configured as the one the snapshot was taken of: the
+    /// same vCPUs, memory and payload, and the same devices in the same order.
+    /// Its devices may use other file descriptors and sockets. Supported on
+    /// Linux.
+    pub fn restore(mut self, dir: &str) -> Result<Self, VmmError> {
+        if !cfg!(target_os = "linux") {
+            return Err(VmmError::FeatureDisabled());
+        }
+        self.restore = Some(dir.to_string());
+        Ok(self)
+    }
+
     pub fn build(self) -> Result<Vmm<'a>, VmmError> {
         build_vm(self).inspect_err(|e| log::error!("{e}"))
     }
@@ -245,6 +263,29 @@ impl VmmHandle {
         }
         #[cfg(target_os = "windows")]
         Err(VmmError::FeatureDisabled())
+    }
+
+    /// Pause the VM and write a snapshot of it into the directory `dir`, which
+    /// [`VmmBuilder::restore`] starts a VM from. The VM stays paused:
+    /// [`VmmHandle::resume`] carries on from where it was. Must not be called
+    /// from the thread running [`Vmm::run`]. Supported on Linux.
+    pub fn snapshot(&self, dir: &str) -> Result<(), VmmError> {
+        #[cfg(target_os = "linux")]
+        {
+            let (done, result) = crossbeam_channel::bounded(1);
+            self.vm_ctl_tx
+                .send(VmCtl::Snapshot(dir.into(), done))
+                .map_err(|e| VmmError::Internal(format!("snapshot: {e}")))?;
+            result
+                .recv()
+                .map_err(|e| VmmError::Internal(format!("snapshot: {e}")))?
+                .map_err(|e| VmmError::Internal(format!("snapshot: {e}")))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = dir;
+            Err(VmmError::FeatureDisabled())
+        }
     }
 
     /// Signal the guest to perform an orderly ACPI shutdown.
@@ -450,6 +491,10 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.reset_exit_code = builder_cfg.reset_exit_code;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
+    #[cfg(target_os = "linux")]
+    {
+        vm_resources.restore_from = builder_cfg.restore.map(PathBuf::from);
+    }
     if !builder_cfg.smbios_oem_strings.is_empty() {
         vm_resources.smbios_oem_strings = Some(builder_cfg.smbios_oem_strings);
     }
