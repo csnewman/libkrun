@@ -2,17 +2,20 @@ use crate::virtio::descriptor_utils::{Reader, Writer};
 
 use super::super::DeviceQueue;
 use super::device::{CacheType, DiskProperties};
+#[cfg(target_os = "linux")]
+use super::uring::{Refused, Uring};
 use crate::virtio::DescriptorChain;
 
 use crate::virtio::InterruptTransport;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::TryReserveError;
+use std::fs::File;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
@@ -212,6 +215,34 @@ impl Drop for IoPoolThreads {
     }
 }
 
+/// A disk's I/O pool, whose threads start when the first queue uses them.
+/// Queues with an io_uring ring serve the disk without the pool, so the pool
+/// starts only where a ring could not be set up, or for a format other than
+/// raw.
+pub(crate) struct SharedIoPool {
+    size: usize,
+    disk: DiskProperties,
+    mem: GuestMemoryMmap,
+    threads: OnceLock<Arc<IoPoolThreads>>,
+}
+
+impl SharedIoPool {
+    pub(crate) fn new(size: usize, disk: DiskProperties, mem: GuestMemoryMmap) -> Self {
+        Self {
+            size,
+            disk,
+            mem,
+            threads: OnceLock::new(),
+        }
+    }
+
+    fn threads(&self) -> Arc<IoPoolThreads> {
+        self.threads
+            .get_or_init(|| Arc::new(IoPoolThreads::new(self.size, &self.disk, &self.mem)))
+            .clone()
+    }
+}
+
 /// One queue's use of the I/O pool: the completions of the requests it sent,
 /// and how many are in flight.
 struct IoPool {
@@ -357,8 +388,16 @@ pub struct BlockWorker {
     stop_fd: EventFd,
     parallel_reads: bool,
     parallel_writes: bool,
-    pool: Option<Arc<IoPoolThreads>>,
+    pool: Option<Arc<SharedIoPool>>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    uring_file: Option<Arc<File>>,
+    #[cfg(target_os = "linux")]
+    uring: Option<Uring>,
 }
+
+/// How many requests a queue's ring holds in flight: a queue's size.
+#[cfg(target_os = "linux")]
+const URING_DEPTH: u32 = 256;
 
 impl BlockWorker {
     #[allow(clippy::too_many_arguments)]
@@ -370,7 +409,8 @@ impl BlockWorker {
         stop_fd: EventFd,
         parallel_reads: bool,
         parallel_writes: bool,
-        pool: Option<Arc<IoPoolThreads>>,
+        pool: Option<Arc<SharedIoPool>>,
+        uring_file: Option<Arc<File>>,
     ) -> Self {
         Self {
             device_queue,
@@ -381,6 +421,9 @@ impl BlockWorker {
             parallel_reads,
             parallel_writes,
             pool,
+            uring_file,
+            #[cfg(target_os = "linux")]
+            uring: None,
         }
     }
 
@@ -394,7 +437,29 @@ impl BlockWorker {
     fn work(mut self) {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
-        let mut pool = self.pool.take().map(IoPool::new);
+        #[cfg(target_os = "linux")]
+        if let Some(file) = self.uring_file.clone() {
+            let (req_align, mem_align) = {
+                let image = self.disk.file.read().unwrap();
+                (image.req_align(), image.mem_align())
+            };
+            match Uring::new(
+                file,
+                self.disk.nsectors() * 512,
+                URING_DEPTH,
+                req_align,
+                mem_align,
+            ) {
+                Ok(uring) => self.uring = Some(uring),
+                Err(e) => log::warn!("no io_uring for the disk, serving it without: {e}"),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let uring_ev_fd = self.uring.as_ref().map(|u| u.event.as_raw_fd());
+        let shared = self.pool.take();
+        #[cfg(target_os = "linux")]
+        let shared = shared.filter(|_| self.uring.is_none());
+        let mut pool = shared.map(|shared| IoPool::new(shared.threads()));
         let pool_completion_ev_fd = pool.as_ref().map(|pool| pool.event.as_raw_fd());
         let mut epoll = Epoll::new().unwrap();
 
@@ -411,6 +476,15 @@ impl BlockWorker {
         );
 
         if let Some(fd) = pool_completion_ev_fd {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::IN, fd as u64),
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = uring_ev_fd {
             let _ = epoll.ctl(
                 ControlOperation::Add,
                 fd,
@@ -440,9 +514,21 @@ impl BlockWorker {
                                 }
                                 self.process_pool_completions(pool);
                             }
+                            #[cfg(target_os = "linux")]
+                            EventSet::IN if Some(source) == uring_ev_fd => {
+                                let done = self.uring.as_mut().unwrap().complete(&self.mem);
+                                self.complete_used(done);
+                            }
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
+                                // Nothing may still be writing into guest
+                                // memory once the worker has gone.
+                                #[cfg(target_os = "linux")]
+                                if let Some(uring) = self.uring.as_mut() {
+                                    let done = uring.wait_idle(&self.mem);
+                                    self.complete_used(done);
+                                }
                                 if let Some(pool) = pool.as_mut() {
                                     self.drain_pool(pool);
                                 }
@@ -461,6 +547,18 @@ impl BlockWorker {
                 }
             }
         }
+    }
+
+    /// Marks requests used, and signals the guest once for them all.
+    #[cfg(target_os = "linux")]
+    fn complete_used(&mut self, done: Vec<(u16, u32)>) {
+        if done.is_empty() {
+            return;
+        }
+        for (head, len) in done {
+            self.add_used(head, len);
+        }
+        self.signal_used_queue();
     }
 
     fn add_used(&mut self, head_index: u16, len: u32) {
@@ -511,6 +609,11 @@ impl BlockWorker {
             self.device_queue.queue.disable_notification(&mem).unwrap();
             while let Some(head) = self.device_queue.queue.pop(&mem) {
                 self.dispatch_request(&mem, pool.as_deref_mut(), head);
+            }
+            // What the batch queued on the ring goes to the kernel together.
+            #[cfg(target_os = "linux")]
+            if let Some(uring) = self.uring.as_mut() {
+                uring.submit();
             }
             if !self.device_queue.queue.enable_notification(&mem).unwrap() {
                 break;
@@ -570,6 +673,53 @@ impl BlockWorker {
                 return;
             }
         };
+
+        #[cfg(target_os = "linux")]
+        if self.uring.is_some() {
+            match request_header.request_type {
+                VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT => {
+                    let read = request_header.request_type == VIRTIO_BLK_T_IN;
+                    let readable: Vec<_> = head
+                        .clone()
+                        .into_iter()
+                        .readable()
+                        .map(|desc| (desc.addr, desc.len))
+                        .collect();
+                    let uring = self.uring.as_mut().unwrap();
+                    let done = if uring.is_full() {
+                        uring.wait_one(mem)
+                    } else {
+                        Vec::new()
+                    };
+                    let pushed = self.uring.as_mut().unwrap().push(
+                        mem,
+                        head_index,
+                        read,
+                        request_header.sector,
+                        &readable,
+                        &buffers,
+                    );
+                    self.complete_used(done);
+                    match pushed {
+                        Ok(()) => return,
+                        Err(Refused::Invalid) => {
+                            self.complete_request(
+                                head_index,
+                                status_writer,
+                                Err(RequestError::InvalidDataLength),
+                            );
+                            return;
+                        }
+                        Err(Refused::Unaligned) => {}
+                    }
+                }
+                // Everything else comes after what the ring has in flight.
+                _ => {
+                    let done = self.uring.as_mut().unwrap().wait_idle(mem);
+                    self.complete_used(done);
+                }
+            }
+        }
 
         if request_header.request_type == VIRTIO_BLK_T_IN
             && self.parallel_reads
@@ -886,6 +1036,7 @@ mod tests {
                 parallel,
                 false,
                 None,
+                None,
             );
             let mut pool =
                 parallel.then(|| IoPool::new(Arc::new(IoPoolThreads::new(2, &worker.disk, &mem))));
@@ -994,6 +1145,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         let mut pool = IoPool::new(Arc::new(IoPoolThreads::new(2, &worker.disk, &mem)));
         worker.dispatch_request(&mem, Some(&mut pool), head);
@@ -1058,6 +1210,7 @@ mod tests {
             EventFd::new(EFD_NONBLOCK).unwrap(),
             false,
             true,
+            None,
             None,
         );
         let mut pool = IoPool::new(Arc::new(IoPoolThreads::new(2, &worker.disk, &mem)));

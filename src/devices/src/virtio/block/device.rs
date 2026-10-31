@@ -15,6 +15,8 @@ use std::num::NonZeroUsize;
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, RwLock};
@@ -40,7 +42,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
 };
 
-use super::worker::{BlockWorker, IoPoolThreads, resolve_pool_size};
+use super::worker::{BlockWorker, SharedIoPool, resolve_pool_size};
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
     Error, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
@@ -251,6 +253,7 @@ pub struct Block {
     queue_config: Vec<QueueConfig>,
     parallel_reads: bool,
     parallel_writes: bool,
+    uring_file: Option<Arc<File>>,
     pool_size: Option<NonZeroUsize>,
 
     // Virtio fields.
@@ -284,8 +287,25 @@ impl Block {
         parallel_writes: bool,
         pool_size: Option<NonZeroUsize>,
         num_queues: u16,
+        io_uring: bool,
     ) -> io::Result<Block> {
         let num_queues = num_queues.max(1);
+        // A raw image is the disk byte for byte, so a ring can read and
+        // write its file directly; other formats go through imago.
+        let uring_file = if io_uring
+            && cfg!(target_os = "linux")
+            && matches!(disk_image_format, DiskFormat::Raw)
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).write(!is_disk_read_only);
+            #[cfg(target_os = "linux")]
+            if direct_io {
+                options.custom_flags(libc::O_DIRECT);
+            }
+            Some(Arc::new(options.open(PathBuf::from(&disk_image_path))?))
+        } else {
+            None
+        };
         let disk_image = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
@@ -381,6 +401,7 @@ impl Block {
             queue_config: vec![QUEUE_CONFIG[0]; num_queues as usize],
             parallel_reads,
             parallel_writes,
+            uring_file,
             pool_size,
         })
     }
@@ -483,7 +504,7 @@ impl VirtioDevice for Block {
                 self.pool_size,
                 thread::available_parallelism().ok().map(|n| n.get()),
             )
-            .map(|size| Arc::new(IoPoolThreads::new(size, &disk, &mem)))
+            .map(|size| Arc::new(SharedIoPool::new(size, disk, mem.clone())))
         } else {
             None
         };
@@ -508,6 +529,7 @@ impl VirtioDevice for Block {
                 self.parallel_reads,
                 self.parallel_writes,
                 pool.clone(),
+                self.uring_file.clone(),
             );
             self.worker_stopfds.push(stopfd);
             self.worker_threads.push(worker.run());
@@ -593,6 +615,7 @@ mod tests {
             false,
             None,
             num_queues,
+            false,
         )
         .expect("create block device")
     }

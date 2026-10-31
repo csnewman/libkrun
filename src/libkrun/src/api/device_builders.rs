@@ -1514,6 +1514,7 @@ pub struct BlockDevice {
     parallel_writes: bool,
     pool_size: Option<NonZeroUsize>,
     num_queues: u16,
+    io_uring: bool,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1536,6 +1537,7 @@ impl BlockDevice {
             parallel_writes: false,
             pool_size: None,
             num_queues: 1,
+            io_uring: false,
         })
     }
 
@@ -1585,6 +1587,16 @@ impl BlockDevice {
         self.parallel_writes = enabled;
     }
 
+    /// Serve reads and writes on a raw image through io_uring, straight between the image and
+    /// guest memory, with a ring per queue.
+    ///
+    /// Disabled by default. Linux only, and raw images only: elsewhere, or where io_uring is
+    /// unavailable, the disk is served as without it, and so are requests that miss the
+    /// alignment direct I/O needs. Takes the place of the I/O pool.
+    pub fn set_io_uring(&mut self, enabled: bool) {
+        self.io_uring = enabled;
+    }
+
     /// Set the number of request queues the device offers (VIRTIO_BLK_F_MQ), each served by
     /// a worker thread of its own.
     ///
@@ -1618,6 +1630,7 @@ impl<'a> AttachDevice<'a> for BlockDevice {
             self.parallel_writes,
             self.pool_size,
             self.num_queues,
+            self.io_uring,
         )
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
 

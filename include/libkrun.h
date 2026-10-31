@@ -613,6 +613,16 @@ typedef void (*krun_block_device_set_pool_size_fn)(KrunBlockDevice handle, size_
 void krun_block_device_set_parallel_writes(KrunBlockDevice handle, bool enabled);
 typedef void (*krun_block_device_set_parallel_writes_fn)(KrunBlockDevice handle, bool enabled);
 /**
+ * Serve reads and writes on a raw image through io_uring, straight between the image and
+ * guest memory, with a ring per queue.
+ *
+ * Disabled by default. Linux only, and raw images only: elsewhere, or where io_uring is
+ * unavailable, the disk is served as without it, and so are requests that miss the
+ * alignment direct I/O needs. Takes the place of the I/O pool.
+ */
+void krun_block_device_set_io_uring(KrunBlockDevice handle, bool enabled);
+typedef void (*krun_block_device_set_io_uring_fn)(KrunBlockDevice handle, bool enabled);
+/**
  * Set the number of request queues the device offers (VIRTIO_BLK_F_MQ), each served by
  * a worker thread of its own.
  *
