@@ -150,9 +150,15 @@ impl PciHostManager {
             vm: vm.clone(),
             gsi: irq,
         });
-        let mut transport =
-            VirtioPciTransport::new(guest_memory, device, irq as u8, intx_line, bar_base as u32)
-                .map_err(Error::CreateTransport)?;
+        let mut transport = VirtioPciTransport::new(
+            guest_memory,
+            device,
+            irq as u8,
+            intx_line,
+            bar_base as u32,
+            None,
+        )
+        .map_err(Error::CreateTransport)?;
         let events = transport.queue_notify_events();
         transport.set_queue_notifications(Arc::new(KvmQueueNotifications { vm, events }));
 

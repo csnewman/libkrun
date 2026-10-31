@@ -102,6 +102,17 @@ pub trait PciQueueNotifications: Send + Sync {
     fn relocate(&self, from: Option<u64>, to: Option<u64>) -> io::Result<()>;
 }
 
+/// Delivers a PCI function's MSI-X interrupts, e.g. through KVM.
+pub trait PciMsiVectors: Send + Sync {
+    /// The number of vectors.
+    fn count(&self) -> u16;
+    /// Sets the message (address, data) that `vector` is delivered as, or
+    /// stops delivering it with `None`.
+    fn route(&self, vector: u16, message: Option<(u64, u32)>) -> io::Result<()>;
+    /// Signals `vector`.
+    fn signal(&self, vector: u16) -> io::Result<()>;
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum PciRootError {
     DuplicateFunction(PciAddress),
