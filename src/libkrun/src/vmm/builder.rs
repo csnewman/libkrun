@@ -2667,8 +2667,10 @@ fn restore_snapshot(vmm: &Vmm, vcpus: &mut [Vcpu], dir: &Path) -> std::result::R
             .unwrap()
             .restore_state(&mpidrs, &gic)
             .map_err(|e| e.to_string())?;
-        if its.is_some() {
-            return Err("the snapshot has an ITS, this VM doesn't".into());
+        match (&its, &vmm.pci_device_manager) {
+            (Some(its), Some(pci)) => pci.restore_its(its)?,
+            (None, _) => {}
+            (Some(_), None) => return Err("the snapshot has an ITS, this VM doesn't".into()),
         }
     }
     #[cfg(target_arch = "x86_64")]
