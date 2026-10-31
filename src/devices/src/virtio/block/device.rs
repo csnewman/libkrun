@@ -15,10 +15,12 @@ use std::num::NonZeroUsize;
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, RwLock};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 
 use imago::{
     DynStorage, FormatAccess, FormatDriverBuilder, PermissiveImplicitOpenGate, Storage,
@@ -40,10 +42,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
 };
 
-use super::worker::BlockWorker;
+use super::worker::{BlockWorker, SharedIoPool, resolve_pool_size};
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
-    Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
+    Error, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
 use crate::virtio::{
@@ -246,10 +248,13 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
-    worker_thread: Option<JoinHandle<()>>,
-    worker_stopfd: EventFd,
+    worker_threads: Vec<JoinHandle<()>>,
+    worker_stopfds: Vec<EventFd>,
+    queue_config: Vec<QueueConfig>,
     parallel_reads: bool,
-    read_pool_size: Option<NonZeroUsize>,
+    parallel_writes: bool,
+    uring_file: Option<Arc<File>>,
+    pool_size: Option<NonZeroUsize>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -279,8 +284,28 @@ impl Block {
         direct_io: bool,
         sync_mode: SyncMode,
         parallel_reads: bool,
-        read_pool_size: Option<NonZeroUsize>,
+        parallel_writes: bool,
+        pool_size: Option<NonZeroUsize>,
+        num_queues: u16,
+        io_uring: bool,
     ) -> io::Result<Block> {
+        let num_queues = num_queues.max(1);
+        // A raw image is the disk byte for byte, so a ring can read and
+        // write its file directly; other formats go through imago.
+        let uring_file = if io_uring
+            && cfg!(target_os = "linux")
+            && matches!(disk_image_format, DiskFormat::Raw)
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).write(!is_disk_read_only);
+            #[cfg(target_os = "linux")]
+            if direct_io {
+                options.custom_flags(libc::O_DIRECT);
+            }
+            Some(Arc::new(options.open(PathBuf::from(&disk_image_path))?))
+        } else {
+            None
+        };
         let disk_image = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
@@ -341,6 +366,10 @@ impl Block {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
         };
 
+        if num_queues > 1 {
+            avail_features |= 1u64 << VIRTIO_BLK_F_MQ;
+        }
+
         let config = VirtioBlkConfig {
             capacity: disk_properties.nsectors(),
             size_max: 0,
@@ -352,6 +381,7 @@ impl Block {
             max_write_zeroes_sectors: u32::MAX,
             max_write_zeroes_seg: 1,
             write_zeroes_may_unmap: 1,
+            num_queues,
             ..Default::default()
         };
 
@@ -366,10 +396,13 @@ impl Block {
             avail_features,
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
-            worker_thread: None,
-            worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            worker_threads: Vec::new(),
+            worker_stopfds: Vec::new(),
+            queue_config: vec![QUEUE_CONFIG[0]; num_queues as usize],
             parallel_reads,
-            read_pool_size,
+            parallel_writes,
+            uring_file,
+            pool_size,
         })
     }
 
@@ -399,7 +432,7 @@ impl VirtioDevice for Block {
     }
 
     fn queue_config(&self) -> &[QueueConfig] {
-        &QUEUE_CONFIG
+        &self.queue_config
     }
 
     fn config_len(&self) -> Option<u32> {
@@ -446,43 +479,71 @@ impl VirtioDevice for Block {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        if self.worker_thread.is_some() {
-            panic!("virtio_blk: worker thread already exists");
+        if !self.worker_threads.is_empty() {
+            panic!("virtio_blk: worker threads already exist");
         }
 
-        let [blk_q]: [_; NUM_QUEUES] = queues.try_into().map_err(|_| {
-            error!("Cannot perform activate. Expected {} queue(s)", NUM_QUEUES);
-            ActivateError::BadActivate
-        })?;
+        if queues.len() != self.queue_config.len() {
+            error!(
+                "Cannot perform activate. Expected {} queue(s)",
+                self.queue_config.len()
+            );
+            return Err(ActivateError::BadActivate);
+        }
 
-        let disk = match self.disk.take() {
-            Some(d) => d,
-            None => DiskProperties::new(
+        // One pool for all the queues, so that more queues don't mean more
+        // threads competing for the host's CPUs.
+        let pool = if self.parallel_reads || self.parallel_writes {
+            let disk = DiskProperties::new(
                 Arc::clone(&self.disk_image),
                 self.disk_image_id.clone(),
                 self.cache_type,
             )
-            .map_err(|_| ActivateError::BadActivate)?,
+            .map_err(|_| ActivateError::BadActivate)?;
+            resolve_pool_size(
+                self.pool_size,
+                thread::available_parallelism().ok().map(|n| n.get()),
+            )
+            .map(|size| Arc::new(SharedIoPool::new(size, disk, mem.clone())))
+        } else {
+            None
         };
 
-        let worker = BlockWorker::new(
-            blk_q,
-            interrupt.clone(),
-            mem.clone(),
-            disk,
-            self.worker_stopfd.try_clone().unwrap(),
-            self.parallel_reads,
-            self.read_pool_size,
-        );
-        self.worker_thread = Some(worker.run());
+        for blk_q in queues {
+            let disk = match self.disk.take() {
+                Some(d) => d,
+                None => DiskProperties::new(
+                    Arc::clone(&self.disk_image),
+                    self.disk_image_id.clone(),
+                    self.cache_type,
+                )
+                .map_err(|_| ActivateError::BadActivate)?,
+            };
+            let stopfd = EventFd::new(EFD_NONBLOCK).map_err(|_| ActivateError::BadActivate)?;
+            let worker = BlockWorker::new(
+                blk_q,
+                interrupt.clone(),
+                mem.clone(),
+                disk,
+                stopfd.try_clone().unwrap(),
+                self.parallel_reads,
+                self.parallel_writes,
+                pool.clone(),
+                self.uring_file.clone(),
+            );
+            self.worker_stopfds.push(stopfd);
+            self.worker_threads.push(worker.run());
+        }
 
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())
     }
 
     fn reset(&mut self) -> bool {
-        if let Some(worker) = self.worker_thread.take() {
-            let _ = self.worker_stopfd.write(1);
+        for stopfd in self.worker_stopfds.drain(..) {
+            let _ = stopfd.write(1);
+        }
+        for worker in self.worker_threads.drain(..) {
             if let Err(e) = worker.join() {
                 error!("error waiting for worker thread: {e:?}");
             }
@@ -533,6 +594,55 @@ mod tests {
             &image_id,
             &long_id.as_bytes()[..VIRTIO_BLK_ID_BYTES as usize]
         );
+    }
+
+    fn block_with_queues(num_queues: u16) -> Block {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(SECTOR_SIZE)
+            .expect("size backing file");
+        Block::new(
+            "test".to_string(),
+            None,
+            CacheType::Unsafe,
+            backing.as_path().to_str().unwrap().to_string(),
+            DiskFormat::Raw,
+            false,
+            false,
+            SyncMode::default(),
+            false,
+            false,
+            None,
+            num_queues,
+            false,
+        )
+        .expect("create block device")
+    }
+
+    #[test]
+    fn single_queue_does_not_offer_multiqueue() {
+        let block = block_with_queues(1);
+
+        assert_eq!(block.queue_config().len(), 1);
+        assert_eq!(block.avail_features() & (1u64 << VIRTIO_BLK_F_MQ), 0);
+    }
+
+    #[test]
+    fn multiple_queues_are_offered_with_multiqueue() {
+        let block = block_with_queues(4);
+
+        assert_eq!(block.queue_config().len(), 4);
+        assert_ne!(block.avail_features() & (1u64 << VIRTIO_BLK_F_MQ), 0);
+        assert_eq!({ block.config.num_queues }, 4);
+    }
+
+    #[test]
+    fn zero_queues_is_one_queue() {
+        let block = block_with_queues(0);
+
+        assert_eq!(block.queue_config().len(), 1);
+        assert_eq!({ block.config.num_queues }, 1);
     }
 
     #[test]

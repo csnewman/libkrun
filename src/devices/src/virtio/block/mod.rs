@@ -3,6 +3,8 @@
 
 #[cfg(feature = "blk")]
 pub mod device;
+#[cfg(all(feature = "blk", target_os = "linux"))]
+mod uring;
 #[cfg(feature = "blk")]
 mod worker;
 

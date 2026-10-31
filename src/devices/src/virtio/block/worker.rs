@@ -2,17 +2,20 @@ use crate::virtio::descriptor_utils::{Reader, Writer};
 
 use super::super::DeviceQueue;
 use super::device::{CacheType, DiskProperties};
+#[cfg(target_os = "linux")]
+use super::uring::{Refused, Uring};
 use crate::virtio::DescriptorChain;
 
 use crate::virtio::InterruptTransport;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::TryReserveError;
+use std::fs::File;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
@@ -77,6 +80,34 @@ struct ReadCompletion {
     data: Option<Vec<u8>>,
 }
 
+/// A write served by the pool: the data is written to the image straight
+/// from the guest's buffers, which a write only reads, so it needs no copy.
+#[derive(Debug)]
+struct WriteJob {
+    head_index: u16,
+    sector: u64,
+    data_len: usize,
+    // The request's readable buffers, header included, and its writable
+    // ones: the status byte.
+    readable: Vec<(GuestAddress, u32)>,
+    writable: Vec<(GuestAddress, u32)>,
+}
+
+struct WriteCompletion {
+    job: WriteJob,
+    ok: bool,
+}
+
+enum PoolJob {
+    Read(ReadJob),
+    Write(WriteJob),
+}
+
+enum PoolCompletion {
+    Read(ReadCompletion),
+    Write(WriteCompletion),
+}
+
 // Aliased guest descriptors can make a read's total length exceed guest RAM and exhaust host memory.
 const PARALLEL_READ_BUFFER_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
@@ -99,52 +130,67 @@ impl Drop for ReadBufferPermit {
     }
 }
 
-struct ReadPool {
-    jobs: Option<Sender<ReadJob>>,
-    completions: Receiver<ReadCompletion>,
-    event: EventFd,
-    workers: Vec<JoinHandle<()>>,
-    pending: usize,
+/// A job for the pool, with where its queue collects the completion.
+struct PoolRequest {
+    job: PoolJob,
+    completions: Sender<PoolCompletion>,
+    event: Arc<EventFd>,
 }
 
-impl ReadPool {
-    fn new(size: usize, disk: &DiskProperties) -> Self {
-        let (jobs, rx) = unbounded::<ReadJob>();
-        // Workers must be able to finish while the dispatcher joins them on drop.
-        let (tx, completions) = unbounded();
-        let event = EventFd::new(EFD_NONBLOCK).unwrap();
-        let workers = (0..size)
+/// The I/O pool's threads, shared by every queue of a disk.
+pub(crate) struct IoPoolThreads {
+    jobs: Option<Sender<PoolRequest>>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl IoPoolThreads {
+    pub(crate) fn new(size: usize, disk: &DiskProperties, mem: &GuestMemoryMmap) -> Self {
+        let (jobs, rx) = unbounded::<PoolRequest>();
+        let disk_id = disk.image_id().to_vec();
+        let cache_type = disk.cache_type();
+        let threads = (0..size)
             .map(|i| {
                 let rx = rx.clone();
-                let tx = tx.clone();
-                let event = event.try_clone().unwrap();
                 let disk = disk.file.clone();
+                let properties =
+                    DiskProperties::new(disk.clone(), disk_id.clone(), cache_type).unwrap();
+                let mem = mem.clone();
                 thread::Builder::new()
-                    .name(format!("block read worker {i}"))
+                    .name(format!("block pool worker {i}"))
                     .spawn(move || {
-                        while let Ok(job) = rx.recv() {
-                            let data = (|| {
-                                let mut data =
-                                    allocate_read_buffer(job.data_len).map_err(io::Error::other)?;
-                                let offset = job
-                                    .sector
-                                    .checked_mul(512)
-                                    .ok_or_else(|| io::Error::other("invalid read sector"))?;
-                                disk.read().unwrap().read(&mut data, offset)?;
-                                Ok::<_, io::Error>(data)
-                            })();
-                            let data = match data {
-                                Ok(data) => Some(data),
-                                Err(e) => {
-                                    error!("error processing read request: {e:?}");
-                                    None
+                        while let Ok(request) = rx.recv() {
+                            let completion = match request.job {
+                                PoolJob::Write(job) => {
+                                    let ok = write_from_guest(&mem, &properties, &job);
+                                    PoolCompletion::Write(WriteCompletion { job, ok })
+                                }
+                                PoolJob::Read(job) => {
+                                    let data = (|| {
+                                        let mut data = allocate_read_buffer(job.data_len)
+                                            .map_err(io::Error::other)?;
+                                        let offset =
+                                            job.sector.checked_mul(512).ok_or_else(|| {
+                                                io::Error::other("invalid read sector")
+                                            })?;
+                                        disk.read().unwrap().read(&mut data, offset)?;
+                                        Ok::<_, io::Error>(data)
+                                    })();
+                                    let data = match data {
+                                        Ok(data) => Some(data),
+                                        Err(e) => {
+                                            error!("error processing read request: {e:?}");
+                                            None
+                                        }
+                                    };
+                                    PoolCompletion::Read(ReadCompletion { job, data })
                                 }
                             };
-                            if tx.send(ReadCompletion { job, data }).is_err() {
-                                return;
-                            }
-                            if let Err(e) = event.write(1) {
-                                error!("failed to signal read completion: {e:?}");
+                            // A queue that has stopped no longer collects its
+                            // completions; the other queues still use the pool.
+                            if request.completions.send(completion).is_ok()
+                                && let Err(e) = request.event.write(1)
+                            {
+                                error!("failed to signal a pool completion: {e:?}");
                             }
                         }
                     })
@@ -153,22 +199,88 @@ impl ReadPool {
             .collect();
         Self {
             jobs: Some(jobs),
-            completions,
-            event,
-            workers,
-            pending: 0,
+            threads,
         }
     }
 }
 
-impl Drop for ReadPool {
+impl Drop for IoPoolThreads {
     fn drop(&mut self) {
         self.jobs.take();
-        for worker in self.workers.drain(..) {
-            if let Err(e) = worker.join() {
-                error!("error waiting for read worker thread: {e:?}");
+        for thread in self.threads.drain(..) {
+            if let Err(e) = thread.join() {
+                error!("error waiting for pool worker thread: {e:?}");
             }
         }
+    }
+}
+
+/// A disk's I/O pool, whose threads start when the first queue uses them.
+/// Queues with an io_uring ring serve the disk without the pool, so the pool
+/// starts only where a ring could not be set up, or for a format other than
+/// raw.
+pub(crate) struct SharedIoPool {
+    size: usize,
+    disk: DiskProperties,
+    mem: GuestMemoryMmap,
+    threads: OnceLock<Arc<IoPoolThreads>>,
+}
+
+impl SharedIoPool {
+    pub(crate) fn new(size: usize, disk: DiskProperties, mem: GuestMemoryMmap) -> Self {
+        Self {
+            size,
+            disk,
+            mem,
+            threads: OnceLock::new(),
+        }
+    }
+
+    fn threads(&self) -> Arc<IoPoolThreads> {
+        self.threads
+            .get_or_init(|| Arc::new(IoPoolThreads::new(self.size, &self.disk, &self.mem)))
+            .clone()
+    }
+}
+
+/// One queue's use of the I/O pool: the completions of the requests it sent,
+/// and how many are in flight.
+struct IoPool {
+    threads: Arc<IoPoolThreads>,
+    sender: Sender<PoolCompletion>,
+    completions: Receiver<PoolCompletion>,
+    event: Arc<EventFd>,
+    pending: usize,
+}
+
+impl IoPool {
+    fn new(threads: Arc<IoPoolThreads>) -> Self {
+        let (sender, completions) = unbounded();
+        Self {
+            threads,
+            sender,
+            completions,
+            event: Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            pending: 0,
+        }
+    }
+
+    fn submit(&mut self, job: PoolJob) {
+        self.threads
+            .jobs
+            .as_ref()
+            .unwrap()
+            .send(PoolRequest {
+                job,
+                completions: self.sender.clone(),
+                event: self.event.clone(),
+            })
+            .unwrap();
+        self.pending += 1;
+    }
+
+    fn size(&self) -> usize {
+        self.threads.threads.len()
     }
 }
 
@@ -179,6 +291,54 @@ fn allocate_read_buffer(len: usize) -> result::Result<Vec<u8>, TryReserveError> 
     buffer.try_reserve_exact(len)?;
     buffer.resize(len, 0);
     Ok(buffer)
+}
+
+fn write_from_guest(mem: &GuestMemoryMmap, disk: &DiskProperties, job: &WriteJob) -> bool {
+    let result = (|| {
+        let mut reader = Reader::from_guest_buffers(mem, job.readable.iter().copied())
+            .map_err(io::Error::other)?;
+        let mut data = reader
+            .split_at(size_of::<RequestHeader>())
+            .map_err(io::Error::other)?;
+        let offset = job
+            .sector
+            .checked_mul(512)
+            .ok_or_else(|| io::Error::other("invalid write sector"))?;
+        data.read_to_at(disk, job.data_len, offset)
+    })();
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            error!("error processing write request: {e:?}");
+            false
+        }
+    }
+}
+
+fn write_write_completion(mem: &GuestMemoryMmap, completion: WriteCompletion) -> (u16, u32) {
+    let head_index = completion.job.head_index;
+    let status: u8 = if completion.ok {
+        VIRTIO_BLK_S_OK.try_into().unwrap()
+    } else {
+        VIRTIO_BLK_S_IOERR.try_into().unwrap()
+    };
+    match Writer::from_guest_buffers(mem, completion.job.writable.iter().copied())
+        .map_err(io::Error::other)
+        .and_then(|mut w| w.write_obj(status))
+    {
+        Ok(()) => (head_index, 1),
+        Err(e) => {
+            error!("Failed to write virtio block status: {e:?}");
+            (head_index, 0)
+        }
+    }
+}
+
+fn write_completion(mem: &GuestMemoryMmap, completion: PoolCompletion) -> (u16, u32) {
+    match completion {
+        PoolCompletion::Read(c) => write_read_completion(mem, c),
+        PoolCompletion::Write(c) => write_write_completion(mem, c),
+    }
 }
 
 fn write_read_completion(mem: &GuestMemoryMmap, completion: ReadCompletion) -> (u16, u32) {
@@ -227,10 +387,20 @@ pub struct BlockWorker {
     disk: DiskProperties,
     stop_fd: EventFd,
     parallel_reads: bool,
-    read_pool_size: Option<NonZeroUsize>,
+    parallel_writes: bool,
+    pool: Option<Arc<SharedIoPool>>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    uring_file: Option<Arc<File>>,
+    #[cfg(target_os = "linux")]
+    uring: Option<Uring>,
 }
 
+/// How many requests a queue's ring holds in flight: a queue's size.
+#[cfg(target_os = "linux")]
+const URING_DEPTH: u32 = 256;
+
 impl BlockWorker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_queue: DeviceQueue,
         interrupt: InterruptTransport,
@@ -238,7 +408,9 @@ impl BlockWorker {
         disk: DiskProperties,
         stop_fd: EventFd,
         parallel_reads: bool,
-        read_pool_size: Option<NonZeroUsize>,
+        parallel_writes: bool,
+        pool: Option<Arc<SharedIoPool>>,
+        uring_file: Option<Arc<File>>,
     ) -> Self {
         Self {
             device_queue,
@@ -247,7 +419,11 @@ impl BlockWorker {
             disk,
             stop_fd,
             parallel_reads,
-            read_pool_size,
+            parallel_writes,
+            pool,
+            uring_file,
+            #[cfg(target_os = "linux")]
+            uring: None,
         }
     }
 
@@ -261,16 +437,30 @@ impl BlockWorker {
     fn work(mut self) {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
-        let read_pool_size = if self.parallel_reads {
-            resolve_read_pool_size(
-                self.read_pool_size,
-                thread::available_parallelism().ok().map(|n| n.get()),
-            )
-        } else {
-            None
-        };
-        let mut read_pool = read_pool_size.map(|size| ReadPool::new(size, &self.disk));
-        let read_completion_ev_fd = read_pool.as_ref().map(|pool| pool.event.as_raw_fd());
+        #[cfg(target_os = "linux")]
+        if let Some(file) = self.uring_file.clone() {
+            let (req_align, mem_align) = {
+                let image = self.disk.file.read().unwrap();
+                (image.req_align(), image.mem_align())
+            };
+            match Uring::new(
+                file,
+                self.disk.nsectors() * 512,
+                URING_DEPTH,
+                req_align,
+                mem_align,
+            ) {
+                Ok(uring) => self.uring = Some(uring),
+                Err(e) => log::warn!("no io_uring for the disk, serving it without: {e}"),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let uring_ev_fd = self.uring.as_ref().map(|u| u.event.as_raw_fd());
+        let shared = self.pool.take();
+        #[cfg(target_os = "linux")]
+        let shared = shared.filter(|_| self.uring.is_none());
+        let mut pool = shared.map(|shared| IoPool::new(shared.threads()));
+        let pool_completion_ev_fd = pool.as_ref().map(|pool| pool.event.as_raw_fd());
         let mut epoll = Epoll::new().unwrap();
 
         let _ = epoll.ctl(
@@ -285,7 +475,16 @@ impl BlockWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
-        if let Some(fd) = read_completion_ev_fd {
+        if let Some(fd) = pool_completion_ev_fd {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::IN, fd as u64),
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = uring_ev_fd {
             let _ = epoll.ctl(
                 ControlOperation::Add,
                 fd,
@@ -305,27 +504,33 @@ impl BlockWorker {
                                 if let Err(e) = self.device_queue.event.read() {
                                     error!("Failed to get queue event: {e:?}");
                                 } else {
-                                    self.process_virtio_queues(read_pool.as_mut());
+                                    self.process_virtio_queues(pool.as_mut());
                                 }
                             }
-                            EventSet::IN if Some(source) == read_completion_ev_fd => {
-                                let pool = read_pool.as_mut().unwrap();
+                            EventSet::IN if Some(source) == pool_completion_ev_fd => {
+                                let pool = pool.as_mut().unwrap();
                                 if let Err(e) = pool.event.read() {
                                     error!("Failed to get read completion event: {e:?}");
                                 }
-                                self.process_read_completions(pool);
+                                self.process_pool_completions(pool);
+                            }
+                            #[cfg(target_os = "linux")]
+                            EventSet::IN if Some(source) == uring_ev_fd => {
+                                let done = self.uring.as_mut().unwrap().complete(&self.mem);
+                                self.complete_used(done);
                             }
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                if let Some(pool) = read_pool.as_mut() {
-                                    pool.jobs.take();
-                                    for completion in pool.completions.iter() {
-                                        let (head, len) =
-                                            write_read_completion(&self.mem, completion);
-                                        self.add_used(head, len);
-                                    }
-                                    self.signal_used_queue();
+                                // Nothing may still be writing into guest
+                                // memory once the worker has gone.
+                                #[cfg(target_os = "linux")]
+                                if let Some(uring) = self.uring.as_mut() {
+                                    let done = uring.wait_idle(&self.mem);
+                                    self.complete_used(done);
+                                }
+                                if let Some(pool) = pool.as_mut() {
+                                    self.drain_pool(pool);
                                 }
                                 return;
                             }
@@ -342,6 +547,18 @@ impl BlockWorker {
                 }
             }
         }
+    }
+
+    /// Marks requests used, and signals the guest once for them all.
+    #[cfg(target_os = "linux")]
+    fn complete_used(&mut self, done: Vec<(u16, u32)>) {
+        if done.is_empty() {
+            return;
+        }
+        for (head, len) in done {
+            self.add_used(head, len);
+        }
+        self.signal_used_queue();
     }
 
     fn add_used(&mut self, head_index: u16, len: u32) {
@@ -362,11 +579,11 @@ impl BlockWorker {
         }
     }
 
-    fn process_read_completions(&mut self, pool: &mut ReadPool) {
+    fn process_pool_completions(&mut self, pool: &mut IoPool) {
         let pending = pool.pending;
         for completion in pool.completions.try_iter() {
             pool.pending -= 1;
-            let (head, len) = write_read_completion(&self.mem, completion);
+            let (head, len) = write_completion(&self.mem, completion);
             self.add_used(head, len);
         }
         if pool.pending != pending {
@@ -374,12 +591,29 @@ impl BlockWorker {
         }
     }
 
-    fn process_virtio_queues(&mut self, mut read_pool: Option<&mut ReadPool>) {
+    /// Waits for everything in flight on the pool, for requests that must come
+    /// after it: flushes, discards and write-zeroes.
+    fn drain_pool(&mut self, pool: &mut IoPool) {
+        while pool.pending > 0 {
+            let completion = pool.completions.recv().unwrap();
+            pool.pending -= 1;
+            let (head, len) = write_completion(&self.mem, completion);
+            self.add_used(head, len);
+        }
+        self.signal_used_queue();
+    }
+
+    fn process_virtio_queues(&mut self, mut pool: Option<&mut IoPool>) {
         let mem = self.mem.clone();
         loop {
             self.device_queue.queue.disable_notification(&mem).unwrap();
             while let Some(head) = self.device_queue.queue.pop(&mem) {
-                self.dispatch_request(&mem, read_pool.as_deref_mut(), head);
+                self.dispatch_request(&mem, pool.as_deref_mut(), head);
+            }
+            // What the batch queued on the ring goes to the kernel together.
+            #[cfg(target_os = "linux")]
+            if let Some(uring) = self.uring.as_mut() {
+                uring.submit();
             }
             if !self.device_queue.queue.enable_notification(&mem).unwrap() {
                 break;
@@ -390,7 +624,7 @@ impl BlockWorker {
     fn dispatch_request(
         &mut self,
         mem: &GuestMemoryMmap,
-        read_pool: Option<&mut ReadPool>,
+        pool: Option<&mut IoPool>,
         head: DescriptorChain<'_>,
     ) {
         let head_index = head.index;
@@ -440,14 +674,62 @@ impl BlockWorker {
             }
         };
 
+        #[cfg(target_os = "linux")]
+        if self.uring.is_some() {
+            match request_header.request_type {
+                VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT => {
+                    let read = request_header.request_type == VIRTIO_BLK_T_IN;
+                    let readable: Vec<_> = head
+                        .clone()
+                        .into_iter()
+                        .readable()
+                        .map(|desc| (desc.addr, desc.len))
+                        .collect();
+                    let uring = self.uring.as_mut().unwrap();
+                    let done = if uring.is_full() {
+                        uring.wait_one(mem)
+                    } else {
+                        Vec::new()
+                    };
+                    let pushed = self.uring.as_mut().unwrap().push(
+                        mem,
+                        head_index,
+                        read,
+                        request_header.sector,
+                        &readable,
+                        &buffers,
+                    );
+                    self.complete_used(done);
+                    match pushed {
+                        Ok(()) => return,
+                        Err(Refused::Invalid) => {
+                            self.complete_request(
+                                head_index,
+                                status_writer,
+                                Err(RequestError::InvalidDataLength),
+                            );
+                            return;
+                        }
+                        Err(Refused::Unaligned) => {}
+                    }
+                }
+                // Everything else comes after what the ring has in flight.
+                _ => {
+                    let done = self.uring.as_mut().unwrap().wait_idle(mem);
+                    self.complete_used(done);
+                }
+            }
+        }
+
         if request_header.request_type == VIRTIO_BLK_T_IN
-            && let Some(pool) = read_pool
+            && self.parallel_reads
+            && let Some(pool) = pool
         {
-            self.process_read_completions(pool);
-            if pool.pending == pool.workers.len() {
+            self.process_pool_completions(pool);
+            if pool.pending == pool.size() {
                 let completion = pool.completions.recv().unwrap();
                 pool.pending -= 1;
-                let (head, len) = write_read_completion(mem, completion);
+                let (head, len) = write_completion(mem, completion);
                 self.add_used(head, len);
                 self.signal_used_queue();
             }
@@ -460,20 +742,56 @@ impl BlockWorker {
                 return;
             }
             if let Some(permit) = ReadBufferPermit::try_acquire(data_len) {
-                pool.jobs
-                    .as_ref()
-                    .unwrap()
-                    .send(ReadJob {
-                        head_index,
-                        sector: request_header.sector,
-                        data_len,
-                        buffers,
-                        _buffer_permit: permit,
-                    })
-                    .unwrap();
-                pool.pending += 1;
+                pool.submit(PoolJob::Read(ReadJob {
+                    head_index,
+                    sector: request_header.sector,
+                    data_len,
+                    buffers,
+                    _buffer_permit: permit,
+                }));
                 return;
             }
+        } else if request_header.request_type == VIRTIO_BLK_T_OUT
+            && self.parallel_writes
+            && let Some(pool) = pool
+        {
+            self.process_pool_completions(pool);
+            if pool.pending == pool.size() {
+                let completion = pool.completions.recv().unwrap();
+                pool.pending -= 1;
+                let (head, len) = write_completion(mem, completion);
+                self.add_used(head, len);
+                self.signal_used_queue();
+            }
+            let data_len = reader.available_bytes();
+            if !data_len.is_multiple_of(512) {
+                self.complete_request(
+                    head_index,
+                    status_writer,
+                    Err(RequestError::InvalidDataLength),
+                );
+                return;
+            }
+            let readable = head
+                .clone()
+                .into_iter()
+                .readable()
+                .map(|desc| (desc.addr, desc.len))
+                .collect();
+            pool.submit(PoolJob::Write(WriteJob {
+                head_index,
+                sector: request_header.sector,
+                data_len,
+                readable,
+                writable: buffers,
+            }));
+            return;
+        } else if matches!(
+            request_header.request_type,
+            VIRTIO_BLK_T_FLUSH | VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES
+        ) && let Some(pool) = pool
+        {
+            self.drain_pool(pool);
         }
 
         let result = Self::process_request(request_header, &mut reader, &mut writer, &self.disk);
@@ -538,7 +856,7 @@ impl BlockWorker {
             }
             VIRTIO_BLK_T_FLUSH => match disk.cache_type() {
                 CacheType::Writeback => {
-                    let diskfile = disk.file.write().unwrap();
+                    let diskfile = disk.file.read().unwrap();
                     diskfile.flush().map_err(RequestError::FlushingToDisk)?;
                     diskfile.sync().map_err(RequestError::FlushingToDisk)?;
                     Ok(0)
@@ -576,16 +894,19 @@ impl BlockWorker {
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
                 let unmap = (discard_write_data.flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
-                let mut diskfile = disk.file.write().unwrap();
                 if unmap {
-                    diskfile
+                    disk.file
+                        .write()
+                        .unwrap()
                         .discard_to_zero(
                             discard_write_data.sector * 512,
                             discard_write_data.num_sectors as u64 * 512,
                         )
                         .map_err(RequestError::DiscardingToZero)?;
                 } else {
-                    diskfile
+                    disk.file
+                        .read()
+                        .unwrap()
                         .write_zeroes(
                             discard_write_data.sector * 512,
                             discard_write_data.num_sectors as u64 * 512,
@@ -599,7 +920,7 @@ impl BlockWorker {
     }
 }
 
-fn resolve_read_pool_size(
+pub(crate) fn resolve_pool_size(
     requested: Option<NonZeroUsize>,
     available_parallelism: Option<usize>,
 ) -> Option<usize> {
@@ -623,6 +944,10 @@ mod tests {
     use vm_memory::Bytes;
 
     fn test_disk(direct_io: bool) -> DiskProperties {
+        test_disk_with(direct_io, false)
+    }
+
+    fn test_disk_with(direct_io: bool, writable: bool) -> DiskProperties {
         let backing = TempFile::new().unwrap();
         let mut file = backing.as_file();
         file.write_all(&[0x11; 512]).unwrap();
@@ -630,10 +955,11 @@ mod tests {
         let file = File::open(
             StorageOpenOptions::new()
                 .filename(backing.as_path().to_str().unwrap())
-                .direct(direct_io),
+                .direct(direct_io)
+                .write(writable),
         )
         .unwrap();
-        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), false).unwrap();
+        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), writable).unwrap();
         DiskProperties::new(
             Arc::new(RwLock::new(FormatAccess::new(raw))),
             Vec::new(),
@@ -642,7 +968,7 @@ mod tests {
         .unwrap()
     }
 
-    fn wait_for_completion(pool: &ReadPool) {
+    fn wait_for_completion(pool: &IoPool) {
         let mut epoll = Epoll::new().unwrap();
         epoll
             .ctl(
@@ -708,9 +1034,12 @@ mod tests {
                 test_disk(false),
                 EventFd::new(EFD_NONBLOCK).unwrap(),
                 parallel,
+                false,
+                None,
                 None,
             );
-            let mut pool = parallel.then(|| ReadPool::new(2, &worker.disk));
+            let mut pool =
+                parallel.then(|| IoPool::new(Arc::new(IoPoolThreads::new(2, &worker.disk, &mem))));
             worker.dispatch_request(&mem, pool.as_mut(), head);
             if let Some(pool) = pool.as_mut()
                 && pool.pending != 0
@@ -718,7 +1047,7 @@ mod tests {
                 assert_eq!(mem.read_obj::<u8>(status_addr).unwrap(), 0xff);
                 mem.write_slice(&[0; 32], GuestAddress(0)).unwrap();
                 wait_for_completion(pool);
-                worker.process_read_completions(pool);
+                worker.process_pool_completions(pool);
             }
 
             assert_eq!(mem.read_obj::<u8>(status_addr).unwrap(), status as u8);
@@ -737,28 +1066,23 @@ mod tests {
     }
 
     #[test]
-    fn read_pool_wakes_dispatcher_and_drains_overlapping_reads_on_drop() {
+    fn pool_wakes_dispatcher_and_drains_overlapping_reads_on_drop() {
         for direct_io in [false, true] {
             let disk = test_disk(direct_io);
             let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
             mem.write_slice(&[0xff; 513], GuestAddress(0x100)).unwrap();
-            let mut pool = ReadPool::new(2, &disk);
+            let mut pool = IoPool::new(Arc::new(IoPoolThreads::new(2, &disk, &mem)));
             let completions = pool.completions.clone();
             for sector in 0..2 {
-                pool.jobs
-                    .as_ref()
-                    .unwrap()
-                    .send(ReadJob {
-                        head_index: sector as u16,
-                        sector,
-                        data_len: 512,
-                        buffers: vec![(GuestAddress(0x100), 513)],
-                        _buffer_permit: ReadBufferPermit::try_acquire(512).unwrap(),
-                    })
-                    .unwrap();
+                pool.submit(PoolJob::Read(ReadJob {
+                    head_index: sector as u16,
+                    sector,
+                    data_len: 512,
+                    buffers: vec![(GuestAddress(0x100), 513)],
+                    _buffer_permit: ReadBufferPermit::try_acquire(512).unwrap(),
+                }));
             }
             wait_for_completion(&pool);
-            pool.jobs.take();
             drop(pool);
 
             let mut data = [0; 513];
@@ -766,6 +1090,9 @@ mod tests {
             assert_eq!(data, [0xff; 513]);
             let mut completed = 0;
             for completion in completions.try_iter() {
+                let PoolCompletion::Read(completion) = completion else {
+                    panic!("a read completed as a write");
+                };
                 let head = completion.job.head_index;
                 assert_eq!(write_read_completion(&mem, completion), (head, 513));
                 mem.read_slice(&mut data, GuestAddress(0x100)).unwrap();
@@ -779,6 +1106,153 @@ mod tests {
     }
 
     #[test]
+    fn pooled_writes_reach_the_disk_and_complete_with_status_alone() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let queue = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let head = create_descriptor_chain(
+            &mem,
+            GuestAddress(0),
+            GuestAddress(0x1000),
+            vec![
+                (DescriptorType::Readable, 16),
+                (DescriptorType::Readable, 512),
+                (DescriptorType::Writable, 1),
+            ],
+            0,
+        )
+        .unwrap();
+        mem.write_obj(
+            RequestHeader {
+                request_type: VIRTIO_BLK_T_OUT,
+                sector: 1,
+                ..Default::default()
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        mem.write_slice(&[0x5a; 512], GuestAddress(0x1010)).unwrap();
+        let status_addr = GuestAddress(0x1210);
+        mem.write_obj(0xff_u8, status_addr).unwrap();
+        let mut worker = BlockWorker::new(
+            DeviceQueue::new(
+                queue.create_queue(),
+                Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            ),
+            InterruptTransport::new(DummyIrqChip::new().into(), "block test".into()).unwrap(),
+            mem.clone(),
+            test_disk_with(false, true),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            true,
+            true,
+            None,
+            None,
+        );
+        let mut pool = IoPool::new(Arc::new(IoPoolThreads::new(2, &worker.disk, &mem)));
+        worker.dispatch_request(&mem, Some(&mut pool), head);
+        assert_eq!(pool.pending, 1);
+        wait_for_completion(&pool);
+        worker.process_pool_completions(&mut pool);
+
+        assert_eq!(pool.pending, 0);
+        assert_eq!(
+            mem.read_obj::<u8>(status_addr).unwrap(),
+            VIRTIO_BLK_S_OK as u8
+        );
+        assert_eq!(queue.used.idx.get(), 1);
+        assert_eq!(queue.used.ring[0].get().len, 1);
+        let mut data = [0; 1024];
+        worker
+            .disk
+            .file
+            .read()
+            .unwrap()
+            .read(&mut data[..], 0)
+            .unwrap();
+        assert_eq!(&data[..512], &[0x11; 512]);
+        assert_eq!(&data[512..], &[0x5a; 512]);
+    }
+
+    #[test]
+    fn reads_stay_serialized_when_only_writes_are_parallel() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let queue = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let head = create_descriptor_chain(
+            &mem,
+            GuestAddress(0),
+            GuestAddress(0x1000),
+            vec![
+                (DescriptorType::Readable, 16),
+                (DescriptorType::Writable, 512),
+                (DescriptorType::Writable, 1),
+            ],
+            0,
+        )
+        .unwrap();
+        mem.write_obj(
+            RequestHeader {
+                request_type: VIRTIO_BLK_T_IN,
+                sector: 0,
+                ..Default::default()
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        let status_addr = GuestAddress(0x1210);
+        mem.write_obj(0xff_u8, status_addr).unwrap();
+        let mut worker = BlockWorker::new(
+            DeviceQueue::new(
+                queue.create_queue(),
+                Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            ),
+            InterruptTransport::new(DummyIrqChip::new().into(), "block test".into()).unwrap(),
+            mem.clone(),
+            test_disk(false),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            false,
+            true,
+            None,
+            None,
+        );
+        let mut pool = IoPool::new(Arc::new(IoPoolThreads::new(2, &worker.disk, &mem)));
+        worker.dispatch_request(&mem, Some(&mut pool), head);
+
+        assert_eq!(pool.pending, 0);
+        assert_eq!(
+            mem.read_obj::<u8>(status_addr).unwrap(),
+            VIRTIO_BLK_S_OK as u8
+        );
+        let mut data = [0; 512];
+        mem.read_slice(&mut data, GuestAddress(0x1010)).unwrap();
+        assert_eq!(data, [0x11; 512]);
+    }
+
+    #[test]
+    fn queues_sharing_the_pool_get_their_own_completions() {
+        let disk = test_disk(false);
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let threads = Arc::new(IoPoolThreads::new(2, &disk, &mem));
+        let mut queues = [IoPool::new(threads.clone()), IoPool::new(threads)];
+        for (index, pool) in queues.iter_mut().enumerate() {
+            pool.submit(PoolJob::Read(ReadJob {
+                head_index: index as u16,
+                sector: index as u64,
+                data_len: 512,
+                buffers: vec![(GuestAddress(0x100 + 0x400 * index as u64), 513)],
+                _buffer_permit: ReadBufferPermit::try_acquire(512).unwrap(),
+            }));
+        }
+
+        for (index, pool) in queues.iter().enumerate() {
+            wait_for_completion(pool);
+            let Ok(PoolCompletion::Read(completion)) = pool.completions.recv() else {
+                panic!("queue {index} got no read completion");
+            };
+            assert_eq!(completion.job.head_index, index as u16);
+            assert!(pool.completions.try_recv().is_err());
+        }
+    }
+
+    #[test]
     fn read_buffer_budget_rejects_oversized_parallel_reads() {
         assert!(ReadBufferPermit::try_acquire(PARALLEL_READ_BUFFER_BUDGET_BYTES + 1).is_none());
         let permit = ReadBufferPermit::try_acquire(63 * 1024 * 1024).unwrap();
@@ -788,20 +1262,17 @@ mod tests {
     }
 
     #[test]
-    fn explicit_read_pool_size_requires_enough_available_parallelism() {
-        assert_eq!(
-            resolve_read_pool_size(NonZeroUsize::new(4), Some(4)),
-            Some(4)
-        );
-        assert_eq!(resolve_read_pool_size(NonZeroUsize::new(5), Some(4)), None);
-        assert_eq!(resolve_read_pool_size(NonZeroUsize::new(4), None), None);
+    fn explicit_pool_size_requires_enough_available_parallelism() {
+        assert_eq!(resolve_pool_size(NonZeroUsize::new(4), Some(4)), Some(4));
+        assert_eq!(resolve_pool_size(NonZeroUsize::new(5), Some(4)), None);
+        assert_eq!(resolve_pool_size(NonZeroUsize::new(4), None), None);
     }
 
     #[test]
-    fn automatic_read_pool_size_uses_existing_sizing() {
-        assert_eq!(resolve_read_pool_size(None, Some(1)), Some(2));
-        assert_eq!(resolve_read_pool_size(None, Some(16)), Some(8));
-        assert_eq!(resolve_read_pool_size(None, None), Some(4));
+    fn automatic_pool_size_uses_existing_sizing() {
+        assert_eq!(resolve_pool_size(None, Some(1)), Some(2));
+        assert_eq!(resolve_pool_size(None, Some(16)), Some(8));
+        assert_eq!(resolve_pool_size(None, None), Some(4));
     }
 
     #[test]
