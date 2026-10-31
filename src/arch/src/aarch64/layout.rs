@@ -88,6 +88,17 @@ pub const VTIMER_IRQ: u32 = GTIMER_VIRT + 16;
 /// Below this address will reside the GIC, above this address will reside the MMIO devices.
 pub const MAPPED_IO_START: u64 = 0x0a00_0000;
 
+/// The PCI host bridge's configuration space (ECAM), bus 0 alone: 32
+/// devices of 8 functions, 4 KiB each.
+pub const PCI_ECAM_START: u64 = 0x3000_0000;
+pub const PCI_ECAM_SIZE: u64 = 0x10_0000;
+/// The window PCI functions' BARs are placed in, 32-bit and below RAM.
+pub const PCI_BAR_START: u64 = 0x3010_0000;
+pub const PCI_BAR_END: u64 = 0x3800_0000;
+/// The last SPI a KVM GIC has: it is given IRQ_MAX - IRQ_BASE + 1 interrupt
+/// IDs, the first 32 of them SGIs and PPIs, and SPIs are numbered from 0.
+pub const KVM_LAST_SPI: u32 = IRQ_MAX - IRQ_BASE - 32;
+
 /// The address to put the SMBIOS contents, if present.
 pub const SMBIOS_START: u64 = 0x4000_F000;
 

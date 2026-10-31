@@ -1,7 +1,9 @@
 // Copyright 2026 The libkrun Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! PCI root and virtio-pci registration for the x86_64 KVM backend.
+//! PCI root and virtio-pci registration for the KVM backend: on x86_64,
+//! described to the guest by ACPI; on aarch64, by the device tree, a generic
+//! ECAM host bridge.
 
 use std::fmt::{Display, Formatter};
 use std::io;
@@ -9,9 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use devices::Bus;
 use devices::pci::{
-    BarWindow, ConfigMechanism1, Ecam, PciAddress, PciFunction, PciIntxLine, PciMsiVectors,
-    PciQueueNotifications, PciRootError,
+    BarWindow, Ecam, PciAddress, PciFunction, PciIntxLine, PciQueueNotifications, PciRootError,
 };
+#[cfg(target_arch = "x86_64")]
+use devices::pci::{ConfigMechanism1, PciMsiVectors};
 use devices::virtio::{
     CreatePciTransportError, VIRTIO_PCI_BAR0_SIZE, VirtioDevice, VirtioPciTransport,
 };
@@ -29,7 +32,9 @@ pub enum Error {
     CreateTransport(CreatePciTransportError),
     IrqsExhausted,
     PciRoot(PciRootError),
+    #[cfg(target_arch = "x86_64")]
     EventFd(io::Error),
+    #[cfg(target_arch = "x86_64")]
     RegisterIrqFd(kvm_ioctls::Error),
 }
 
@@ -40,7 +45,9 @@ impl Display for Error {
             Self::CreateTransport(err) => write!(f, "failed to create virtio-pci transport: {err}"),
             Self::IrqsExhausted => write!(f, "no more GSIs are available for PCI INTx"),
             Self::PciRoot(err) => write!(f, "failed to register PCI function: {err}"),
+            #[cfg(target_arch = "x86_64")]
             Self::EventFd(err) => write!(f, "failed to create an MSI-X eventfd: {err}"),
+            #[cfg(target_arch = "x86_64")]
             Self::RegisterIrqFd(err) => write!(f, "failed to register an MSI-X irqfd: {err}"),
         }
     }
@@ -48,13 +55,27 @@ impl Display for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// A function as the guest is told of it: by ACPI on x86_64, by the device
+/// tree on aarch64.
+#[cfg(target_arch = "x86_64")]
+pub type PciFunctionInfo = arch::x86_64::PciFunctionInfo;
+#[cfg(target_arch = "aarch64")]
+pub type PciFunctionInfo = devices::fdt::PciFdtFunction;
+
+#[cfg(target_arch = "aarch64")]
+use arch::aarch64::layout::{PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START};
+#[cfg(target_arch = "x86_64")]
+use arch::x86_64::layout::{PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START};
+
 /// Owns the bus-0 PCI functions and their guest address windows.
 pub struct PciHostManager {
     root: devices::pci::SharedPciRoot,
     next_device: u8,
     irqs: IrqAllocator,
-    functions: Vec<arch::x86_64::PciFunctionInfo>,
+    functions: Vec<PciFunctionInfo>,
+    #[cfg(target_arch = "x86_64")]
     msi: Option<Arc<msi::MsiRouter>>,
+    #[cfg(target_arch = "x86_64")]
     next_msi_gsi: u32,
 }
 
@@ -65,8 +86,15 @@ struct KvmPciIntxLine {
 
 impl PciIntxLine for KvmPciIntxLine {
     fn set_level(&self, asserted: bool) -> std::io::Result<()> {
+        // On aarch64 the line is named by its type and GIC interrupt ID: an
+        // SPI, numbered from 32.
+        #[cfg(target_arch = "aarch64")]
+        let line = (kvm_bindings::KVM_ARM_IRQ_TYPE_SPI << kvm_bindings::KVM_ARM_IRQ_TYPE_SHIFT)
+            | (self.gsi + 32);
+        #[cfg(target_arch = "x86_64")]
+        let line = self.gsi;
         self.vm
-            .set_irq_line(self.gsi, asserted)
+            .set_irq_line(line, asserted)
             .map_err(|err| std::io::Error::from_raw_os_error(err.errno()))
     }
 }
@@ -105,7 +133,9 @@ impl PciHostManager {
             next_device: 1,
             irqs,
             functions: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
             msi: None,
+            #[cfg(target_arch = "x86_64")]
             next_msi_gsi: msi::MSI_GSI_BASE,
         }
     }
@@ -113,10 +143,12 @@ impl PciHostManager {
     /// Enables MSI-X, delivered by KVM's in-kernel irqchip, for the functions
     /// added after this call. Not for a split irqchip, whose userspace IOAPIC
     /// owns KVM's routing table: its functions keep INTx.
+    #[cfg(target_arch = "x86_64")]
     pub fn enable_msi(&mut self, vm: Arc<VmFd>) {
         self.msi = Some(Arc::new(msi::MsiRouter::new(vm)));
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub fn register_config_io(&self, bus: &mut Bus) -> Result<()> {
         bus.insert(
             Arc::new(Mutex::new(ConfigMechanism1::new(self.root.clone()))),
@@ -129,17 +161,14 @@ impl PciHostManager {
     pub fn register_mmio(&self, bus: &mut Bus) -> Result<()> {
         bus.insert(
             Arc::new(Mutex::new(Ecam::new(self.root.clone()))),
-            arch::x86_64::layout::PCI_ECAM_START,
-            arch::x86_64::layout::PCI_ECAM_SIZE,
+            PCI_ECAM_START,
+            PCI_ECAM_SIZE,
         )
         .map_err(Error::Bus)?;
         bus.insert(
-            Arc::new(Mutex::new(BarWindow::new(
-                self.root.clone(),
-                arch::x86_64::layout::PCI_BAR_START,
-            ))),
-            arch::x86_64::layout::PCI_BAR_START,
-            arch::x86_64::layout::PCI_BAR_END - arch::x86_64::layout::PCI_BAR_START,
+            Arc::new(Mutex::new(BarWindow::new(self.root.clone(), PCI_BAR_START))),
+            PCI_BAR_START,
+            PCI_BAR_END - PCI_BAR_START,
         )
         .map_err(Error::Bus)
     }
@@ -149,15 +178,14 @@ impl PciHostManager {
         vm: Arc<VmFd>,
         guest_memory: GuestMemoryMmap,
         device: Arc<Mutex<dyn VirtioDevice>>,
-    ) -> Result<arch::x86_64::PciFunctionInfo> {
+    ) -> Result<PciFunctionInfo> {
         if self.next_device > 31 {
             return Err(Error::IrqsExhausted);
         }
 
         let address = PciAddress::new(PCI_BUS0, self.next_device, 0);
-        let bar_base = arch::x86_64::layout::PCI_BAR_START
-            + u64::from(self.next_device - 1) * VIRTIO_PCI_BAR0_SIZE;
-        if bar_base + VIRTIO_PCI_BAR0_SIZE > arch::x86_64::layout::PCI_BAR_END {
+        let bar_base = PCI_BAR_START + u64::from(self.next_device - 1) * VIRTIO_PCI_BAR0_SIZE;
+        if bar_base + VIRTIO_PCI_BAR0_SIZE > PCI_BAR_END {
             return Err(Error::IrqsExhausted);
         }
         let irq = self.irqs.alloc().map_err(|_| Error::IrqsExhausted)?;
@@ -165,6 +193,7 @@ impl PciHostManager {
             vm: vm.clone(),
             gsi: irq,
         });
+        #[cfg(target_arch = "x86_64")]
         let msix_vectors: Option<Arc<dyn PciMsiVectors>> = match &self.msi {
             Some(router) => {
                 // One for the configuration, and one for each queue.
@@ -176,6 +205,8 @@ impl PciHostManager {
             }
             None => None,
         };
+        #[cfg(target_arch = "aarch64")]
+        let msix_vectors = None;
         let mut transport = VirtioPciTransport::new(
             guest_memory,
             device,
@@ -195,16 +226,34 @@ impl PciHostManager {
             .insert(address, function)
             .map_err(Error::PciRoot)?;
 
-        let info = arch::x86_64::PciFunctionInfo {
+        #[cfg(target_arch = "x86_64")]
+        let info = PciFunctionInfo {
             device: address.device,
             function: address.function,
             gsi: irq,
+        };
+        #[cfg(target_arch = "aarch64")]
+        let info = PciFunctionInfo {
+            device: address.device,
+            irq,
         };
         self.functions.push(info);
         self.next_device += 1;
         Ok(info)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    pub fn fdt_info(&self) -> devices::fdt::PciFdtInfo {
+        devices::fdt::PciFdtInfo {
+            ecam_base: PCI_ECAM_START,
+            ecam_size: PCI_ECAM_SIZE,
+            bar_base: PCI_BAR_START,
+            bar_size: PCI_BAR_END - PCI_BAR_START,
+            functions: self.functions.clone(),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
     pub fn acpi_info(&self) -> arch::x86_64::PciHostInfo {
         arch::x86_64::PciHostInfo {
             ecam_base: arch::x86_64::layout::PCI_ECAM_START,
@@ -217,6 +266,7 @@ impl PciHostManager {
 
 /// MSI-X delivery through KVM: one router owns the GSI routing table for all
 /// functions, and each function has its own vectors.
+#[cfg(target_arch = "x86_64")]
 mod msi {
     use std::collections::BTreeMap;
     use std::io;
@@ -367,11 +417,13 @@ mod msi {
 mod tests {
     use super::super::super::super::builder;
     use super::*;
+    #[cfg(target_arch = "x86_64")]
     use crate::vmm::device_manager::mmio::MMIODeviceManager;
+    #[cfg(target_arch = "x86_64")]
     use devices::legacy::{DummyIrqChip, KvmIoapic};
-    use devices::virtio::{
-        ActivateResult, DeviceQueue, InterruptTransport, MmioTransport, QueueConfig,
-    };
+    #[cfg(target_arch = "x86_64")]
+    use devices::virtio::MmioTransport;
+    use devices::virtio::{ActivateResult, DeviceQueue, InterruptTransport, QueueConfig};
     use vm_memory::GuestAddress;
 
     /// VIRTIO_F_VERSION_1 feature bit, required by the PCI transport.
@@ -429,6 +481,8 @@ mod tests {
         Arc::new(Mutex::new(DummyDevice))
     }
 
+    // The MMIO device's irqfd needs an in-kernel irqchip: the IOAPIC.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_mmio_and_pci_devices_get_distinct_irqs() {
         let guest_mem = GuestMemoryMmap::from_ranges(&[

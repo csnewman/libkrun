@@ -343,7 +343,8 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         .device_manager
         .as_ref()
         .is_some_and(|manager| manager.uses_pci());
-    if pci_enabled && !builder_cfg.acpi {
+    // x86_64 describes PCI by ACPI; aarch64 by the device tree.
+    if pci_enabled && !builder_cfg.acpi && cfg!(target_arch = "x86_64") {
         return Err(VmmError::InvalidParam());
     }
 
