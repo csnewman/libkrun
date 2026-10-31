@@ -438,14 +438,16 @@ impl Vmm {
         Ok(())
     }
 
-    /// The devices with state for a snapshot, in registration order.
+    /// The devices with state for a snapshot, MMIO ones and then PCI ones,
+    /// each in registration order.
     #[cfg(target_os = "linux")]
     pub(crate) fn snapshottables(&self) -> std::result::Result<Snapshottables, String> {
-        #[cfg(target_arch = "x86_64")]
-        if self.pci_device_manager.is_some() {
-            return Err("PCI devices can't be snapshotted".into());
+        let mut devices = self.mmio_device_manager.snapshottables().to_vec();
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if let Some(pci) = &self.pci_device_manager {
+            devices.extend_from_slice(pci.snapshottables());
         }
-        Ok(self.mmio_device_manager.snapshottables().to_vec())
+        Ok(devices)
     }
 
     /// Pauses the VM and writes a snapshot of it into `dir`: its vCPUs,

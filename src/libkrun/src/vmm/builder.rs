@@ -2757,7 +2757,7 @@ pub(crate) fn attach_mmio_device(
 ))]
 pub(crate) fn attach_pci_device(
     vmm: &mut Vmm,
-    _id: String,
+    id: String,
     _intc: IrqChip,
     device: Arc<Mutex<dyn VirtioDevice>>,
 ) -> std::result::Result<(), device_manager::pci::Error> {
@@ -2767,9 +2767,12 @@ pub(crate) fn attach_pci_device(
         .as_mut()
         .expect("PCI device manager must exist when attaching PCI devices");
     #[cfg(target_os = "linux")]
-    pci.register_virtio_device(vmm.vm.fd_shared(), guest_memory, device)?;
+    pci.register_virtio_device(vmm.vm.fd_shared(), guest_memory, device, id)?;
     #[cfg(target_os = "windows")]
-    pci.register_virtio_device(_intc, guest_memory, device)?;
+    {
+        let _ = id;
+        pci.register_virtio_device(_intc, guest_memory, device)?;
+    }
     Ok(())
 }
 

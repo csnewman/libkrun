@@ -9,7 +9,6 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use devices::Bus;
 #[cfg(target_arch = "x86_64")]
 use devices::pci::ConfigMechanism1;
 use devices::pci::{
@@ -19,6 +18,7 @@ use devices::pci::{
 use devices::virtio::{
     CreatePciTransportError, VIRTIO_PCI_BAR0_SIZE, VirtioDevice, VirtioPciTransport,
 };
+use devices::{Bus, Snapshottable};
 use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
@@ -78,6 +78,7 @@ pub struct PciHostManager {
     next_msi_gsi: u32,
     #[cfg(target_arch = "aarch64")]
     its: Option<kvm_ioctls::DeviceFd>,
+    snapshottables: Vec<(String, Arc<Mutex<dyn Snapshottable>>)>,
 }
 
 struct KvmPciIntxLine {
@@ -138,7 +139,13 @@ impl PciHostManager {
             next_msi_gsi: msi::MSI_GSI_BASE,
             #[cfg(target_arch = "aarch64")]
             its: None,
+            snapshottables: Vec::new(),
         }
+    }
+
+    /// The functions' transports, for a snapshot, in registration order.
+    pub fn snapshottables(&self) -> &[(String, Arc<Mutex<dyn Snapshottable>>)] {
+        &self.snapshottables
     }
 
     /// Enables MSI-X, delivered by KVM's in-kernel irqchip, for the functions
@@ -209,6 +216,7 @@ impl PciHostManager {
         vm: Arc<VmFd>,
         guest_memory: GuestMemoryMmap,
         device: Arc<Mutex<dyn VirtioDevice>>,
+        id: String,
     ) -> Result<PciFunctionInfo> {
         if self.next_device > 31 {
             return Err(Error::IrqsExhausted);
@@ -252,12 +260,14 @@ impl PciHostManager {
         let events = transport.queue_notify_events();
         transport.set_queue_notifications(Arc::new(KvmQueueNotifications { vm, events }));
 
-        let function: Arc<Mutex<dyn PciFunction>> = Arc::new(Mutex::new(transport));
+        let transport = Arc::new(Mutex::new(transport));
+        let function: Arc<Mutex<dyn PciFunction>> = transport.clone();
         self.root
             .lock()
             .expect("Poisoned PCI root lock")
             .insert(address, function)
             .map_err(Error::PciRoot)?;
+        self.snapshottables.push((id, transport));
 
         #[cfg(target_arch = "x86_64")]
         let info = PciFunctionInfo {
@@ -581,10 +591,15 @@ mod tests {
             .register_mmio_device(vm.fd(), transport, 0, "rtc".to_string())
             .unwrap();
         let first = pci
-            .register_virtio_device(vm.fd_shared(), guest_mem.clone(), dummy_device())
+            .register_virtio_device(
+                vm.fd_shared(),
+                guest_mem.clone(),
+                dummy_device(),
+                "a".into(),
+            )
             .unwrap();
         let second = pci
-            .register_virtio_device(vm.fd_shared(), guest_mem, dummy_device())
+            .register_virtio_device(vm.fd_shared(), guest_mem, dummy_device(), "b".into())
             .unwrap();
 
         assert_eq!(mmio_irq, arch::IRQ_BASE);
@@ -604,7 +619,7 @@ mod tests {
         let mut pci = PciHostManager::new(irqs);
 
         let err = pci
-            .register_virtio_device(vm.fd_shared(), guest_mem, dummy_device())
+            .register_virtio_device(vm.fd_shared(), guest_mem, dummy_device(), "b".into())
             .unwrap_err();
         assert!(matches!(err, Error::IrqsExhausted));
     }
