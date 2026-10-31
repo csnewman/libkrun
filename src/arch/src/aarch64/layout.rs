@@ -98,6 +98,10 @@ pub const PCI_BAR_END: u64 = 0x3800_0000;
 /// The last SPI a KVM GIC has: it is given IRQ_MAX - IRQ_BASE + 1 interrupt
 /// IDs, the first 32 of them SGIs and PPIs, and SPIs are numbered from 0.
 pub const KVM_LAST_SPI: u32 = IRQ_MAX - IRQ_BASE - 32;
+/// The GIC's ITS, which turns PCI functions' MSIs into interrupts: two 64
+/// KiB frames, below the GIC's redistributors.
+pub const GIC_ITS_START: u64 = 0x0800_0000;
+pub const GIC_ITS_SIZE: u64 = 0x2_0000;
 
 /// The address to put the SMBIOS contents, if present.
 pub const SMBIOS_START: u64 = 0x4000_F000;

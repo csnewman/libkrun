@@ -1309,6 +1309,14 @@ pub fn build_microvm(
             Arc::new(Mutex::new(gic))
         };
 
+        // MSI-X goes through the GIC ITS. Without one (a GICv2 has none),
+        // PCI functions keep INTx.
+        if let Some(pci) = pci_device_manager.as_mut()
+            && let Err(e) = pci.enable_its(vm.fd_shared())
+        {
+            warn!("PCI functions will use INTx: {e}");
+        }
+
         attach_legacy_devices(
             &vm,
             &mut mmio_device_manager,
