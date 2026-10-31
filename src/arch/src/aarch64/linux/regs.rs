@@ -101,8 +101,9 @@ macro_rules! arm64_sys_reg {
 // Constant imported from the Linux kernel:
 // https://elixir.bootlin.com/linux/v4.20.17/source/arch/arm64/include/asm/sysreg.h#L135
 arm64_sys_reg!(MPIDR_EL1, 3, 0, 0, 0, 5);
-// KVM_REG_ARM_TIMER_CNT from arch/arm64/include/uapi/asm/kvm.h: the guest's virtual counter.
-arm64_sys_reg!(TIMER_CNT, 3, 3, 14, 3, 2);
+// From arch/arm64/include/uapi/asm/kvm.h: the guest's virtual counter.
+arm64_sys_reg!(KVM_REG_ARM_TIMER_CNT, 3, 3, 14, 3, 2);
+pub const TIMER_CNT: u64 = KVM_REG_ARM_TIMER_CNT;
 
 /// Configure core registers for a given CPU.
 ///
