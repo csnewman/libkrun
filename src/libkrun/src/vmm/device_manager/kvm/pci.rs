@@ -148,6 +148,60 @@ impl PciHostManager {
         &self.snapshottables
     }
 
+    /// The ITS's state for a snapshot, with the vCPUs paused. Its tables go
+    /// into guest memory, which the snapshot's memory image carries.
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_its(&self) -> std::result::Result<Option<Vec<u8>>, String> {
+        let Some(its) = &self.its else {
+            return Ok(None);
+        };
+        its_ctrl(its, kvm_bindings::KVM_DEV_ARM_ITS_SAVE_TABLES)
+            .map_err(|e| format!("saving the ITS tables: {e}"))?;
+        let mut regs = Vec::with_capacity(ITS_REGS.len());
+        for &offset in ITS_REGS {
+            let value =
+                its_get(its, offset).map_err(|e| format!("ITS register {offset:#x}: {e}"))?;
+            regs.push((offset, value));
+        }
+        bincode::encode_to_vec(&regs, bincode::config::standard())
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Loads what [`PciHostManager::save_its`] saved, once the redistributors
+    /// and guest memory are restored.
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_its(&self, state: &[u8]) -> std::result::Result<(), String> {
+        let Some(its) = &self.its else {
+            return Err("the snapshot has an ITS, this VM doesn't".into());
+        };
+        let (regs, _): (Vec<(u32, u64)>, _) =
+            bincode::decode_from_slice(state, bincode::config::standard())
+                .map_err(|e| format!("ITS state: {e}"))?;
+        let value = |offset: u32| {
+            regs.iter()
+                .find(|(o, _)| *o == offset)
+                .map(|(_, v)| *v)
+                .ok_or_else(|| format!("ITS state lacks register {offset:#x}"))
+        };
+        let set = |offset: u32| -> std::result::Result<(), String> {
+            its_set(its, offset, value(offset)?)
+                .map_err(|e| format!("ITS register {offset:#x}: {e}"))
+        };
+        // The order KVM documents: GITS_IIDR before any other register, the
+        // tables restored from guest memory, and GITS_CTLR last.
+        set(GITS_IIDR)?;
+        set(GITS_CBASER)?;
+        for n in 0..8 {
+            set(GITS_BASER + 8 * n)?;
+        }
+        set(GITS_CREADR)?;
+        set(GITS_CWRITER)?;
+        its_ctrl(its, kvm_bindings::KVM_DEV_ARM_ITS_RESTORE_TABLES)
+            .map_err(|e| format!("restoring the ITS tables: {e}"))?;
+        set(GITS_CTLR)
+    }
+
     /// Enables MSI-X, delivered by KVM's in-kernel irqchip, for the functions
     /// added after this call. Not for a split irqchip, whose userspace IOAPIC
     /// owns KVM's routing table: its functions keep INTx.
@@ -311,6 +365,75 @@ impl PciHostManager {
             functions: self.functions.clone(),
         }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+const GITS_CTLR: u32 = 0x0000;
+#[cfg(target_arch = "aarch64")]
+const GITS_IIDR: u32 = 0x0004;
+#[cfg(target_arch = "aarch64")]
+const GITS_CBASER: u32 = 0x0080;
+#[cfg(target_arch = "aarch64")]
+const GITS_CWRITER: u32 = 0x0088;
+#[cfg(target_arch = "aarch64")]
+const GITS_CREADR: u32 = 0x0090;
+#[cfg(target_arch = "aarch64")]
+const GITS_BASER: u32 = 0x0100;
+
+#[cfg(target_arch = "aarch64")]
+const ITS_REGS: &[u32] = &[
+    GITS_CTLR,
+    GITS_IIDR,
+    GITS_CBASER,
+    GITS_CWRITER,
+    GITS_CREADR,
+    GITS_BASER,
+    GITS_BASER + 0x08,
+    GITS_BASER + 0x10,
+    GITS_BASER + 0x18,
+    GITS_BASER + 0x20,
+    GITS_BASER + 0x28,
+    GITS_BASER + 0x30,
+    GITS_BASER + 0x38,
+];
+
+#[cfg(target_arch = "aarch64")]
+fn its_get(its: &kvm_ioctls::DeviceFd, offset: u32) -> std::result::Result<u64, kvm_ioctls::Error> {
+    let mut value = 0u64;
+    let mut attr = kvm_bindings::kvm_device_attr {
+        group: kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+        attr: u64::from(offset),
+        addr: &mut value as *mut u64 as u64,
+        flags: 0,
+    };
+    // SAFETY: `addr` points at a u64 that outlives the call, which is what
+    // this group writes.
+    unsafe { its.get_device_attr(&mut attr) }?;
+    Ok(value)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn its_set(
+    its: &kvm_ioctls::DeviceFd,
+    offset: u32,
+    value: u64,
+) -> std::result::Result<(), kvm_ioctls::Error> {
+    its.set_device_attr(&kvm_bindings::kvm_device_attr {
+        group: kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+        attr: u64::from(offset),
+        addr: &value as *const u64 as u64,
+        flags: 0,
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn its_ctrl(its: &kvm_ioctls::DeviceFd, attr: u32) -> std::result::Result<(), kvm_ioctls::Error> {
+    its.set_device_attr(&kvm_bindings::kvm_device_attr {
+        group: kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CTRL,
+        attr: u64::from(attr),
+        addr: 0,
+        flags: 0,
+    })
 }
 
 /// MSI-X delivery through KVM: one router owns the GSI routing table for all
