@@ -10,11 +10,12 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use devices::Bus;
-use devices::pci::{
-    BarWindow, Ecam, PciAddress, PciFunction, PciIntxLine, PciQueueNotifications, PciRootError,
-};
 #[cfg(target_arch = "x86_64")]
-use devices::pci::{ConfigMechanism1, PciMsiVectors};
+use devices::pci::ConfigMechanism1;
+use devices::pci::{
+    BarWindow, Ecam, PciAddress, PciFunction, PciIntxLine, PciMsiVectors, PciQueueNotifications,
+    PciRootError,
+};
 use devices::virtio::{
     CreatePciTransportError, VIRTIO_PCI_BAR0_SIZE, VirtioDevice, VirtioPciTransport,
 };
@@ -32,10 +33,10 @@ pub enum Error {
     CreateTransport(CreatePciTransportError),
     IrqsExhausted,
     PciRoot(PciRootError),
-    #[cfg(target_arch = "x86_64")]
     EventFd(io::Error),
-    #[cfg(target_arch = "x86_64")]
     RegisterIrqFd(kvm_ioctls::Error),
+    #[cfg(target_arch = "aarch64")]
+    CreateIts(kvm_ioctls::Error),
 }
 
 impl Display for Error {
@@ -45,10 +46,10 @@ impl Display for Error {
             Self::CreateTransport(err) => write!(f, "failed to create virtio-pci transport: {err}"),
             Self::IrqsExhausted => write!(f, "no more GSIs are available for PCI INTx"),
             Self::PciRoot(err) => write!(f, "failed to register PCI function: {err}"),
-            #[cfg(target_arch = "x86_64")]
             Self::EventFd(err) => write!(f, "failed to create an MSI-X eventfd: {err}"),
-            #[cfg(target_arch = "x86_64")]
             Self::RegisterIrqFd(err) => write!(f, "failed to register an MSI-X irqfd: {err}"),
+            #[cfg(target_arch = "aarch64")]
+            Self::CreateIts(err) => write!(f, "failed to create the GIC ITS: {err}"),
         }
     }
 }
@@ -63,7 +64,9 @@ pub use arch::x86_64::PciFunctionInfo;
 pub use devices::fdt::PciFdtFunction as PciFunctionInfo;
 
 #[cfg(target_arch = "aarch64")]
-use arch::aarch64::layout::{PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START};
+use arch::aarch64::layout::{
+    GIC_ITS_SIZE, GIC_ITS_START, PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START,
+};
 #[cfg(target_arch = "x86_64")]
 use arch::x86_64::layout::{PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START};
 #[cfg(target_arch = "aarch64")]
@@ -75,10 +78,10 @@ pub struct PciHostManager {
     next_device: u8,
     irqs: IrqAllocator,
     functions: Vec<PciFunctionInfo>,
-    #[cfg(target_arch = "x86_64")]
     msi: Option<Arc<msi::MsiRouter>>,
-    #[cfg(target_arch = "x86_64")]
     next_msi_gsi: u32,
+    #[cfg(target_arch = "aarch64")]
+    its: Option<kvm_ioctls::DeviceFd>,
 }
 
 struct KvmPciIntxLine {
@@ -135,10 +138,10 @@ impl PciHostManager {
             next_device: 1,
             irqs,
             functions: Vec::new(),
-            #[cfg(target_arch = "x86_64")]
             msi: None,
-            #[cfg(target_arch = "x86_64")]
             next_msi_gsi: msi::MSI_GSI_BASE,
+            #[cfg(target_arch = "aarch64")]
+            its: None,
         }
     }
 
@@ -148,6 +151,36 @@ impl PciHostManager {
     #[cfg(target_arch = "x86_64")]
     pub fn enable_msi(&mut self, vm: Arc<VmFd>) {
         self.msi = Some(Arc::new(msi::MsiRouter::new(vm)));
+    }
+
+    /// Creates the GIC ITS and enables MSI-X through it for the functions
+    /// added after this call. The GIC must be a GICv3, created before.
+    #[cfg(target_arch = "aarch64")]
+    pub fn enable_its(&mut self, vm: Arc<VmFd>) -> Result<()> {
+        let mut device = kvm_bindings::kvm_create_device {
+            type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_ITS,
+            fd: 0,
+            flags: 0,
+        };
+        let its = vm.create_device(&mut device).map_err(Error::CreateIts)?;
+        let addr = GIC_ITS_START;
+        its.set_device_attr(&kvm_bindings::kvm_device_attr {
+            group: kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ADDR,
+            attr: u64::from(kvm_bindings::KVM_VGIC_ITS_ADDR_TYPE),
+            addr: &addr as *const u64 as u64,
+            flags: 0,
+        })
+        .map_err(Error::CreateIts)?;
+        its.set_device_attr(&kvm_bindings::kvm_device_attr {
+            group: kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CTRL,
+            attr: u64::from(kvm_bindings::KVM_DEV_ARM_VGIC_CTRL_INIT),
+            addr: 0,
+            flags: 0,
+        })
+        .map_err(Error::CreateIts)?;
+        self.its = Some(its);
+        self.msi = Some(Arc::new(msi::MsiRouter::new(vm)));
+        Ok(())
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -195,20 +228,22 @@ impl PciHostManager {
             vm: vm.clone(),
             gsi: irq,
         });
-        #[cfg(target_arch = "x86_64")]
         let msix_vectors: Option<Arc<dyn PciMsiVectors>> = match &self.msi {
             Some(router) => {
                 // One for the configuration, and one for each queue.
                 let count = device.lock().unwrap().queue_config().len() as u32 + 1;
+                // The ITS tells functions apart by their requester ID.
+                #[cfg(target_arch = "aarch64")]
+                let devid = Some(u32::from(address.device) << 3 | u32::from(address.function));
+                #[cfg(target_arch = "x86_64")]
+                let devid = None;
                 let vectors =
-                    msi::KvmMsiVectors::new(&vm, router.clone(), self.next_msi_gsi, count)?;
+                    msi::KvmMsiVectors::new(&vm, router.clone(), self.next_msi_gsi, devid, count)?;
                 self.next_msi_gsi += count;
                 Some(Arc::new(vectors))
             }
             None => None,
         };
-        #[cfg(target_arch = "aarch64")]
-        let msix_vectors = None;
         let mut transport = VirtioPciTransport::new(
             guest_memory,
             device,
@@ -252,6 +287,7 @@ impl PciHostManager {
             bar_base: PCI_BAR_START,
             bar_size: PCI_BAR_END - PCI_BAR_START,
             functions: self.functions.clone(),
+            its: self.its.as_ref().map(|_| (GIC_ITS_START, GIC_ITS_SIZE)),
         }
     }
 
@@ -268,25 +304,32 @@ impl PciHostManager {
 
 /// MSI-X delivery through KVM: one router owns the GSI routing table for all
 /// functions, and each function has its own vectors.
-#[cfg(target_arch = "x86_64")]
 mod msi {
     use std::collections::BTreeMap;
     use std::io;
     use std::sync::{Arc, Mutex};
 
+    #[cfg(target_arch = "aarch64")]
+    use arch::aarch64::layout::KVM_LAST_SPI;
     use devices::pci::PciMsiVectors;
     use kvm_bindings::{
-        KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
-        KVM_IRQCHIP_PIC_SLAVE, KvmIrqRouting, kvm_irq_routing_entry,
-        kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip, kvm_irq_routing_msi,
+        KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID, KvmIrqRouting,
+        kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
+        kvm_irq_routing_msi, kvm_irq_routing_msi__bindgen_ty_1,
     };
+    #[cfg(target_arch = "x86_64")]
+    use kvm_bindings::{KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE};
     use kvm_ioctls::VmFd;
     use utils::eventfd::{EFD_NONBLOCK, EventFd};
 
     use super::{Error, Result};
 
     /// The first GSI for MSIs, after the IOAPIC's 24 pins.
+    #[cfg(target_arch = "x86_64")]
     pub const MSI_GSI_BASE: u32 = 24;
+    /// The first GSI for MSIs, after the GIC's SPIs.
+    #[cfg(target_arch = "aarch64")]
+    pub const MSI_GSI_BASE: u32 = KVM_LAST_SPI + 1;
 
     fn irqchip_route(gsi: u32, irqchip: u32, pin: u32) -> kvm_irq_routing_entry {
         kvm_irq_routing_entry {
@@ -299,9 +342,19 @@ mod msi {
         }
     }
 
+    /// KVM's default routes for the GIC, which setting the table would
+    /// otherwise drop: a GSI for each SPI.
+    #[cfg(target_arch = "aarch64")]
+    fn default_routes() -> Vec<kvm_irq_routing_entry> {
+        (0..=KVM_LAST_SPI)
+            .map(|pin| irqchip_route(pin, 0, pin))
+            .collect()
+    }
+
     /// KVM's default routes for the in-kernel irqchip, which setting the
     /// table would otherwise drop: the IOAPIC's 24 pins, and the two PICs'
     /// 8 pins each for the first 16.
+    #[cfg(target_arch = "x86_64")]
     fn default_routes() -> Vec<kvm_irq_routing_entry> {
         let mut routes = Vec::new();
         for gsi in 0..24 {
@@ -335,8 +388,9 @@ mod msi {
         }
 
         /// Routes `gsi` to the MSI message (address, data), or removes its
-        /// route with `None`.
-        fn set(&self, gsi: u32, message: Option<(u64, u32)>) -> io::Result<()> {
+        /// route with `None`. `devid` is the sender's device ID, where the
+        /// interrupt controller tells devices apart (the GIC ITS).
+        fn set(&self, gsi: u32, devid: Option<u32>, message: Option<(u64, u32)>) -> io::Result<()> {
             let mut routes = self.routes.lock().unwrap();
             match message {
                 Some((address, data)) => {
@@ -345,12 +399,19 @@ mod msi {
                         kvm_irq_routing_entry {
                             gsi,
                             type_: KVM_IRQ_ROUTING_MSI,
+                            flags: if devid.is_some() {
+                                KVM_MSI_VALID_DEVID
+                            } else {
+                                0
+                            },
                             u: kvm_irq_routing_entry__bindgen_ty_1 {
                                 msi: kvm_irq_routing_msi {
                                     address_lo: address as u32,
                                     address_hi: (address >> 32) as u32,
                                     data,
-                                    ..Default::default()
+                                    __bindgen_anon_1: kvm_irq_routing_msi__bindgen_ty_1 {
+                                        devid: devid.unwrap_or(0),
+                                    },
                                 },
                             },
                             ..Default::default()
@@ -376,11 +437,18 @@ mod msi {
     pub struct KvmMsiVectors {
         router: Arc<MsiRouter>,
         gsi_base: u32,
+        devid: Option<u32>,
         events: Vec<EventFd>,
     }
 
     impl KvmMsiVectors {
-        pub fn new(vm: &VmFd, router: Arc<MsiRouter>, gsi_base: u32, count: u32) -> Result<Self> {
+        pub fn new(
+            vm: &VmFd,
+            router: Arc<MsiRouter>,
+            gsi_base: u32,
+            devid: Option<u32>,
+            count: u32,
+        ) -> Result<Self> {
             let events = (0..count)
                 .map(|vector| {
                     let event = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?;
@@ -392,6 +460,7 @@ mod msi {
             Ok(Self {
                 router,
                 gsi_base,
+                devid,
                 events,
             })
         }
@@ -403,7 +472,8 @@ mod msi {
         }
 
         fn route(&self, vector: u16, message: Option<(u64, u32)>) -> io::Result<()> {
-            self.router.set(self.gsi_base + u32::from(vector), message)
+            self.router
+                .set(self.gsi_base + u32::from(vector), self.devid, message)
         }
 
         fn signal(&self, vector: u16) -> io::Result<()> {
