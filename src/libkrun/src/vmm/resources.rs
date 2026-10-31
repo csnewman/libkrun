@@ -11,7 +11,7 @@ use std::io::BufReader;
 use std::os::fd::RawFd;
 #[cfg(target_os = "windows")]
 use std::os::windows::raw::HANDLE;
-#[cfg(feature = "tee")]
+#[cfg(any(feature = "tee", target_os = "linux"))]
 use std::path::PathBuf;
 
 #[cfg(feature = "tee")]
@@ -121,6 +121,9 @@ pub struct VmResources {
     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
     /// discovered via the kernel command line and SMP uses the MP table.
     pub acpi_enabled: bool,
+    /// A snapshot to restore the VM from, rather than boot it.
+    #[cfg(target_os = "linux")]
+    pub restore_from: Option<PathBuf>,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
@@ -272,6 +275,8 @@ mod tests {
             reset_exit_code: None,
             split_irqchip: false,
             acpi_enabled: false,
+            #[cfg(target_os = "linux")]
+            restore_from: None,
             serial_consoles: Vec::new(),
             kernel_console: None,
             #[cfg(target_arch = "riscv64")]
