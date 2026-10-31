@@ -22,6 +22,8 @@ use std::os::fd::{AsFd, BorrowedFd, FromRawFd};
 use std::os::windows::io::AsHandle;
 #[cfg(windows)]
 use std::os::windows::io::BorrowedHandle;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
@@ -246,6 +248,8 @@ pub enum StartMicrovmError {
         any(target_os = "linux", target_os = "windows")
     ))]
     PciSharedMemoryNotSupported,
+    /// Failed to restore the VM from a snapshot.
+    Restore(String),
     /// Cannot attest the VM in the Secure Virtualization context.
     SecureVirtAttest(VstateError),
     /// Cannot initialize the Secure Virtualization backend.
@@ -538,6 +542,7 @@ impl Display for StartMicrovmError {
             PciSharedMemoryNotSupported => {
                 write!(f, "PCI shared-memory regions are not supported yet")
             }
+            Restore(ref msg) => write!(f, "Failed to restore the VM from its snapshot: {msg}"),
             SecureVirtAttest(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -1193,7 +1198,8 @@ pub fn build_microvm(
         Arc::new(VcpuList::new(cpu_count as u64))
     };
 
-    let vcpus;
+    #[allow(unused_mut)]
+    let mut vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
@@ -1426,6 +1432,10 @@ pub fn build_microvm(
         paused_clock: None,
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         paused_counter: None,
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        intc: intc.clone(),
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        vcpu_mpidrs: Vec::new(),
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -1582,6 +1592,11 @@ pub fn build_microvm(
         }
 
         println!("Starting TEE/microVM.");
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = &vm_resources.restore_from {
+        restore_snapshot(&vmm, &mut vcpus, dir).map_err(StartMicrovmError::Restore)?;
     }
 
     vmm.start_vcpus(vcpus)
@@ -2588,6 +2603,102 @@ fn create_vcpus_aarch64(
     vcpus[0].set_boot_senders(boot_senders);
 
     Ok(vcpus)
+}
+
+/// Loads a snapshot into a VM built as the one it was taken of, in place of
+/// its boot: guest memory, the vCPUs, the interrupt controller and the
+/// devices, whose workers start again. Runs before the vCPUs start.
+#[cfg(target_os = "linux")]
+fn restore_snapshot(vmm: &Vmm, vcpus: &mut [Vcpu], dir: &Path) -> std::result::Result<(), String> {
+    use super::snapshot::{Snapshot, read_memory};
+    use super::vstate::VCPU_SNAPSHOT_VERSION;
+    #[cfg(target_arch = "aarch64")]
+    use super::vstate::snapshot_counter;
+    use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
+
+    let snap = Snapshot::read(dir).map_err(|e| e.to_string())?;
+    let devices = vmm.snapshottables()?;
+    let ids: Vec<String> = devices.iter().map(|(id, _)| id.clone()).collect();
+    let mem_bytes: u64 = vmm.guest_memory.iter().map(|r| r.len()).sum();
+    snap.manifest
+        .validate((mem_bytes >> 20) as usize, vcpus.len() as u8, &ids)
+        .map_err(|e| e.to_string())?;
+    if snap.vcpus.len() != vcpus.len() || snap.devices.len() != devices.len() {
+        return Err("the snapshot's sections don't match its manifest".into());
+    }
+
+    read_memory(&vmm.guest_memory, &snap.memory).map_err(|e| e.to_string())?;
+
+    for (vcpu, (version, state)) in vcpus.iter_mut().zip(&snap.vcpus) {
+        if *version != VCPU_SNAPSHOT_VERSION {
+            return Err(format!("unsupported vcpu state version {version}"));
+        }
+        vcpu.restore_snapshot(state)?;
+    }
+    // The vCPUs stopped moments apart; they resume at the latest of their
+    // counters, so it is the same on every vCPU and never goes back.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut counter = 0;
+        for (_, state) in &snap.vcpus {
+            counter = counter.max(snapshot_counter(state)?);
+        }
+        for vcpu in vcpus.iter() {
+            vcpu.set_counter(counter)?;
+        }
+    }
+
+    let Some((version, irqchip)) = &snap.irqchip else {
+        return Err("the snapshot has no interrupt controller state".into());
+    };
+    if *version != super::IRQCHIP_SNAPSHOT_VERSION {
+        return Err(format!(
+            "unsupported interrupt controller state version {version}"
+        ));
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ((gic, its), _): ((Vec<u8>, Option<Vec<u8>>), _) =
+            bincode::decode_from_slice(irqchip, bincode::config::standard())
+                .map_err(|e| format!("interrupt controller state: {e}"))?;
+        let mpidrs: Vec<u64> = vcpus.iter().map(|vcpu| vcpu.get_mpidr()).collect();
+        vmm.intc
+            .lock()
+            .unwrap()
+            .restore_state(&mpidrs, &gic)
+            .map_err(|e| e.to_string())?;
+        if its.is_some() {
+            return Err("the snapshot has an ITS, this VM doesn't".into());
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    vmm.vm.restore_snapshot(irqchip)?;
+    #[cfg(target_arch = "riscv64")]
+    {
+        let _ = irqchip;
+        return Err("snapshots are not supported on riscv64".into());
+    }
+
+    for ((id, device), (saved_id, state)) in devices.iter().zip(&snap.devices) {
+        if id != saved_id {
+            return Err(format!("snapshot device {saved_id} is {id} in this VM"));
+        }
+        device
+            .lock()
+            .unwrap()
+            .restore(state)
+            .map_err(|e| format!("device {id}: {e}"))?;
+    }
+    // After the interrupt controller is in: a worker raises interrupts as
+    // soon as it runs.
+    for (id, device) in &devices {
+        device
+            .lock()
+            .unwrap()
+            .resume()
+            .map_err(|e| format!("device {id}: {e}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
