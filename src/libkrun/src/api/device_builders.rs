@@ -139,8 +139,15 @@ impl<'a> AttachContext<'a> {
             intc,
             device_index,
             register_fn: Box::new(|vmm, id, intc, device| {
-                attach_pci_device(vmm, id, intc, device)
-                    .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
+                // virtio-pci can't carry a shared memory region, so a device
+                // with one goes on virtio-mmio.
+                if device.lock().unwrap().shm_region().is_some() {
+                    attach_mmio_device(vmm, id, intc, device)
+                        .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
+                } else {
+                    attach_pci_device(vmm, id, intc, device)
+                        .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
+                }
                 Ok(())
             }),
             #[cfg(target_os = "macos")]
@@ -365,6 +372,9 @@ pub struct MmioDeviceManager<'a> {
 /// Available on x86_64 Linux and Windows hosts, where the VM must enable ACPI
 /// with [`VmmBuilder::acpi`](crate::api::vmm_builder::VmmBuilder::acpi), and on
 /// aarch64 Linux hosts, where the device tree describes the PCI host bridge.
+///
+/// A device with a shared memory region, such as a GPU with blob resources or
+/// virtio-fs with a DAX window, is attached over virtio-mmio instead.
 #[cfg(any(
     all(
         target_arch = "x86_64",

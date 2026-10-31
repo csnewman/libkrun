@@ -238,12 +238,6 @@ pub enum StartMicrovmError {
         any(target_os = "linux", target_os = "windows")
     ))]
     PciRequiresAcpi,
-    /// PCI shared-memory capabilities are not implemented yet.
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    PciSharedMemoryNotSupported,
     /// Cannot attest the VM in the Secure Virtualization context.
     SecureVirtAttest(VstateError),
     /// Cannot initialize the Secure Virtualization backend.
@@ -529,13 +523,6 @@ impl Display for StartMicrovmError {
                 any(target_os = "linux", target_os = "windows")
             ))]
             PciRequiresAcpi => write!(f, "PCI devices require ACPI to be enabled"),
-            #[cfg(all(
-                target_arch = "x86_64",
-                any(target_os = "linux", target_os = "windows")
-            ))]
-            PciSharedMemoryNotSupported => {
-                write!(f, "PCI shared-memory regions are not supported yet")
-            }
             SecureVirtAttest(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -792,29 +779,6 @@ pub fn build_microvm(
     let requirements = device_manager.requirements();
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     let legacy_rtc = !requirements.iter().any(|r| r.replaces_legacy_rtc);
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    if pci_enabled
-        && requirements
-            .iter()
-            .any(|requirements| requirements.shm_size.is_some())
-    {
-        return Err(StartMicrovmError::PciSharedMemoryNotSupported);
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(target_os = "linux", target_os = "windows"),
-        feature = "gpu"
-    ))]
-    if pci_enabled
-        && requirements
-            .iter()
-            .any(|requirements| requirements.gpu_shm.is_some())
-    {
-        return Err(StartMicrovmError::PciSharedMemoryNotSupported);
-    }
     let fs_shm_sizes: Vec<Option<usize>> = requirements.iter().map(|r| r.shm_size).collect();
     #[cfg(feature = "gpu")]
     let gpu_shm_size = requirements.iter().filter_map(|r| r.gpu_shm).next();
