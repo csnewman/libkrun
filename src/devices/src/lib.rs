@@ -19,11 +19,13 @@ pub mod display;
 pub mod fdt;
 pub mod legacy;
 pub mod pci;
+pub mod snapshot;
 pub mod virtio;
 #[cfg(windows)]
 pub mod windows_console;
 
 pub use self::bus::{Bus, BusDevice, Error as BusError};
+pub use self::snapshot::{SavedState, Snapshottable};
 
 #[derive(Debug)]
 pub enum Error {
@@ -37,6 +39,17 @@ pub enum Error {
     IoError(io::Error),
     NoAvailBuffers,
     SpuriousEvent,
+    /// Snapshot save/restore failed, or is unsupported by this device.
+    Snapshot(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::Snapshot(e) => write!(f, "{e}"),
+            other => write!(f, "{other:?}"),
+        }
+    }
 }
 
 /// Types of devices that can get attached to this platform.
