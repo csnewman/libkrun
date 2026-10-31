@@ -4,6 +4,7 @@ use std::result;
 use std::thread;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::virtio::net::backend::ConnectError;
@@ -35,6 +36,23 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+
+    stop: EventFd,
+}
+
+/// A running worker, which can be stopped and run again.
+pub struct NetWorkerHandle {
+    stop: EventFd,
+    thread: thread::JoinHandle<NetWorker>,
+}
+
+impl NetWorkerHandle {
+    /// Stops the worker between frames and returns it, with its backend
+    /// connection and any frame it holds.
+    pub fn stop(self) -> thread::Result<NetWorker> {
+        let _ = self.stop.write(1);
+        self.thread.join()
+    }
 }
 
 impl NetWorker {
@@ -87,25 +105,46 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+
+            stop: EventFd::new(EFD_NONBLOCK).map_err(|e| {
+                ConnectError::CreateSocket(nix::Error::from_raw(e.raw_os_error().unwrap_or(0)))
+            })?,
         })
     }
 
-    pub fn run(self) {
-        thread::Builder::new()
+    pub fn run(self) -> NetWorkerHandle {
+        let stop = self.stop.try_clone().unwrap();
+        let thread = thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
             .unwrap();
+        NetWorkerHandle { stop, thread }
     }
 
-    fn work(mut self) {
+    /// The worker's queues, copied, for a snapshot.
+    pub fn queues(&self) -> Vec<DeviceQueue> {
+        [&self.rx_q, &self.tx_q]
+            .into_iter()
+            .map(|dq| DeviceQueue::new(dq.queue.copy(), dq.event.clone()))
+            .collect()
+    }
+
+    fn work(mut self) -> Self {
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
 
         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
+        let stop_fd = self.stop.as_raw_fd();
 
         let mut epoll = Epoll::new().unwrap();
+
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            stop_fd,
+            &EpollEvent::new(EventSet::IN, stop_fd as u64),
+        );
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -134,6 +173,10 @@ impl NetWorker {
                         let source = event.fd();
                         let event_set = event.event_set();
                         match event_set {
+                            EventSet::IN if source == stop_fd => {
+                                let _ = self.stop.read();
+                                return self;
+                            }
                             EventSet::IN if source == virtq_rx_ev_fd => {
                                 self.process_rx_queue_event();
                             }
