@@ -7,6 +7,8 @@
 
 #[cfg(target_arch = "aarch64")]
 use arch::ArchMemoryInfo;
+#[cfg(target_arch = "aarch64")]
+use arch::aarch64::regs::{read_counter, write_counter};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use libc::{c_int, c_void, siginfo_t};
 use std::cell::Cell;
@@ -1658,18 +1660,20 @@ impl Vcpu {
         match self.event_receiver.try_recv() {
             // Running ---- Pause ----> Paused
             Ok(VcpuEvent::Pause) => {
-                // Nothing special to do.
                 self.response_sender
-                    .send(VcpuResponse::Paused)
+                    .send(self.pause_response())
                     .expect("failed to send pause status");
-
-                // TODO: we should call `KVM_KVMCLOCK_CTRL` here to make sure
-                // TODO continued: the guest soft lockup watchdog does not panic on Resume.
 
                 // Move to 'paused' state.
                 state = StateMachine::next(Self::paused);
             }
             Ok(VcpuEvent::Resume) => {
+                self.response_sender
+                    .send(VcpuResponse::Resumed)
+                    .expect("failed to send resume status");
+            }
+            #[cfg(target_arch = "aarch64")]
+            Ok(VcpuEvent::ResumeAt(_)) => {
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
@@ -1686,6 +1690,35 @@ impl Vcpu {
         state
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn pause_response(&self) -> VcpuResponse {
+        // Tells a guest using kvmclock that it was stopped, so its soft lockup
+        // watchdog doesn't fire on resume. Fails if the guest doesn't use kvmclock.
+        if let Err(e) = self.fd.kvmclock_ctrl() {
+            debug!("KVM_KVMCLOCK_CTRL: {e}");
+        }
+        VcpuResponse::Paused
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn pause_response(&self) -> VcpuResponse {
+        match read_counter(&self.fd) {
+            Ok(counter) => VcpuResponse::PausedAt(counter),
+            Err(e) => {
+                warn!(
+                    "vcpu {}: failed to read the virtual counter: {e:?}",
+                    self.id
+                );
+                VcpuResponse::Paused
+            }
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn pause_response(&self) -> VcpuResponse {
+        VcpuResponse::Paused
+    }
+
     // This is the main loop of the `Paused` state.
     fn paused(&mut self) -> StateMachine<Self> {
         match self.event_receiver.recv() {
@@ -1696,6 +1729,19 @@ impl Vcpu {
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
                 // Move to 'running' state.
+                StateMachine::next(Self::running)
+            }
+            #[cfg(target_arch = "aarch64")]
+            Ok(VcpuEvent::ResumeAt(counter)) => {
+                if let Err(e) = write_counter(&self.fd, counter) {
+                    warn!(
+                        "vcpu {}: failed to restore the virtual counter: {e:?}",
+                        self.id
+                    );
+                }
+                self.response_sender
+                    .send(VcpuResponse::Resumed)
+                    .expect("failed to send resume status");
                 StateMachine::next(Self::running)
             }
             // All other events have no effect on current 'paused' state.
@@ -1780,7 +1826,9 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    /// Resume the Vcpu with the guest's virtual counter at the given value.
+    #[cfg(target_arch = "aarch64")]
+    ResumeAt(u64),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1789,6 +1837,9 @@ pub enum VcpuEvent {
 pub enum VcpuResponse {
     /// Vcpu is paused.
     Paused,
+    /// Vcpu is paused, with the guest's virtual counter at the given value.
+    #[cfg(target_arch = "aarch64")]
+    PausedAt(u64),
     /// Vcpu is resumed.
     Resumed,
     /// Vcpu is stopped.
