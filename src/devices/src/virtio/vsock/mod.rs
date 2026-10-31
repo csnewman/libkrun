@@ -115,6 +115,11 @@ mod defs {
         /// Defined in `include/uapi/linux/virtio_ids.h`.
         pub const VIRTIO_ID_VSOCK: u32 = 19;
 
+        /// The event telling the driver the transport was reset, and its
+        /// connections with it.
+        /// Defined in `/include/uapi/linux/virtio_vsock.h`.
+        pub const VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: u32 = 0;
+
         /// Vsock packet operation IDs.
         /// Defined in `/include/uapi/linux/virtio_vsock.h`.
         ///
