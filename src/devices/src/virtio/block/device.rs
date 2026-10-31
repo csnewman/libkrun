@@ -509,7 +509,7 @@ impl VirtioDevice for Block {
             None
         };
 
-        for blk_q in queues {
+        for (index, blk_q) in queues.into_iter().enumerate() {
             let disk = match self.disk.take() {
                 Some(d) => d,
                 None => DiskProperties::new(
@@ -520,9 +520,11 @@ impl VirtioDevice for Block {
                 .map_err(|_| ActivateError::BadActivate)?,
             };
             let stopfd = EventFd::new(EFD_NONBLOCK).map_err(|_| ActivateError::BadActivate)?;
+            // Each queue's worker signals that queue's vector alone: the
+            // others' would find nothing new in their used rings.
             let worker = BlockWorker::new(
                 blk_q,
-                interrupt.clone(),
+                interrupt.for_queue(index),
                 mem.clone(),
                 disk,
                 stopfd.try_clone().unwrap(),
