@@ -36,9 +36,12 @@ pub use device_builders::InputDevice;
 pub use device_builders::NetDevice;
 #[cfg(feature = "net")]
 pub use device_builders::NetFlags;
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "linux", target_os = "windows")
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ),
+    all(target_arch = "aarch64", target_os = "linux")
 ))]
 pub use device_builders::PciDeviceManager;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -76,12 +79,12 @@ ffier::library_definition!("krun", library_tag = 1,
     primitives_prefix = "krun",
     crate::api::error::VmmError = 1,
     crate::api::device_builders::MmioDeviceManager<'_> = 2,
-    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    #[cfg(any(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")), all(target_arch = "aarch64", target_os = "linux")))]
     crate::api::device_builders::PciDeviceManager<'_> = 25,
     trait crate::api::device_builders::DeviceManager = 26,
     crate::api::device_builders::DeviceManager
         for crate::api::device_builders::MmioDeviceManager,
-    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    #[cfg(any(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")), all(target_arch = "aarch64", target_os = "linux")))]
     crate::api::device_builders::DeviceManager
         for crate::api::device_builders::PciDeviceManager,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
