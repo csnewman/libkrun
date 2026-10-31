@@ -612,6 +612,18 @@ typedef void (*krun_block_device_set_pool_size_fn)(KrunBlockDevice handle, size_
  */
 void krun_block_device_set_parallel_writes(KrunBlockDevice handle, bool enabled);
 typedef void (*krun_block_device_set_parallel_writes_fn)(KrunBlockDevice handle, bool enabled);
+/**
+ * Set the number of request queues the device offers (VIRTIO_BLK_F_MQ), each served by
+ * a worker thread of its own.
+ *
+ * Defaults to 1. Linux's driver uses at most one queue per vCPU; queues beyond that are
+ * left unused, each with an idle worker thread. With parallel reads or writes enabled, the
+ * queues share one I/O pool: more queues then help writes and direct I/O, but can slow
+ * down cached reads.
+ * 0 is taken as 1.
+ */
+void krun_block_device_set_num_queues(KrunBlockDevice handle, uint16_t num_queues);
+typedef void (*krun_block_device_set_num_queues_fn)(KrunBlockDevice handle, uint16_t num_queues);
 void krun_block_device_destroy(KrunBlockDevice handle);
 typedef void (*krun_block_device_destroy_fn)(KrunBlockDevice handle);
 

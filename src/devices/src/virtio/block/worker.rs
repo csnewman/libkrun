@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
@@ -127,27 +127,27 @@ impl Drop for ReadBufferPermit {
     }
 }
 
-struct IoPool {
-    jobs: Option<Sender<PoolJob>>,
-    completions: Receiver<PoolCompletion>,
-    event: EventFd,
-    workers: Vec<JoinHandle<()>>,
-    pending: usize,
+/// A job for the pool, with where its queue collects the completion.
+struct PoolRequest {
+    job: PoolJob,
+    completions: Sender<PoolCompletion>,
+    event: Arc<EventFd>,
 }
 
-impl IoPool {
-    fn new(size: usize, disk: &DiskProperties, mem: &GuestMemoryMmap) -> Self {
-        let (jobs, rx) = unbounded::<PoolJob>();
-        // Workers must be able to finish while the dispatcher joins them on drop.
-        let (tx, completions) = unbounded();
-        let event = EventFd::new(EFD_NONBLOCK).unwrap();
+/// The I/O pool's threads, shared by every queue of a disk.
+pub(crate) struct IoPoolThreads {
+    jobs: Option<Sender<PoolRequest>>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl IoPoolThreads {
+    pub(crate) fn new(size: usize, disk: &DiskProperties, mem: &GuestMemoryMmap) -> Self {
+        let (jobs, rx) = unbounded::<PoolRequest>();
         let disk_id = disk.image_id().to_vec();
         let cache_type = disk.cache_type();
-        let workers = (0..size)
+        let threads = (0..size)
             .map(|i| {
                 let rx = rx.clone();
-                let tx = tx.clone();
-                let event = event.try_clone().unwrap();
                 let disk = disk.file.clone();
                 let properties =
                     DiskProperties::new(disk.clone(), disk_id.clone(), cache_type).unwrap();
@@ -155,48 +155,39 @@ impl IoPool {
                 thread::Builder::new()
                     .name(format!("block pool worker {i}"))
                     .spawn(move || {
-                        while let Ok(job) = rx.recv() {
-                            let job = match job {
-                                PoolJob::Read(job) => job,
+                        while let Ok(request) = rx.recv() {
+                            let completion = match request.job {
                                 PoolJob::Write(job) => {
                                     let ok = write_from_guest(&mem, &properties, &job);
-                                    if tx
-                                        .send(PoolCompletion::Write(WriteCompletion { job, ok }))
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                    if let Err(e) = event.write(1) {
-                                        error!("failed to signal write completion: {e:?}");
-                                    }
-                                    continue;
+                                    PoolCompletion::Write(WriteCompletion { job, ok })
+                                }
+                                PoolJob::Read(job) => {
+                                    let data = (|| {
+                                        let mut data = allocate_read_buffer(job.data_len)
+                                            .map_err(io::Error::other)?;
+                                        let offset =
+                                            job.sector.checked_mul(512).ok_or_else(|| {
+                                                io::Error::other("invalid read sector")
+                                            })?;
+                                        disk.read().unwrap().read(&mut data, offset)?;
+                                        Ok::<_, io::Error>(data)
+                                    })();
+                                    let data = match data {
+                                        Ok(data) => Some(data),
+                                        Err(e) => {
+                                            error!("error processing read request: {e:?}");
+                                            None
+                                        }
+                                    };
+                                    PoolCompletion::Read(ReadCompletion { job, data })
                                 }
                             };
-                            let data = (|| {
-                                let mut data =
-                                    allocate_read_buffer(job.data_len).map_err(io::Error::other)?;
-                                let offset = job
-                                    .sector
-                                    .checked_mul(512)
-                                    .ok_or_else(|| io::Error::other("invalid read sector"))?;
-                                disk.read().unwrap().read(&mut data, offset)?;
-                                Ok::<_, io::Error>(data)
-                            })();
-                            let data = match data {
-                                Ok(data) => Some(data),
-                                Err(e) => {
-                                    error!("error processing read request: {e:?}");
-                                    None
-                                }
-                            };
-                            if tx
-                                .send(PoolCompletion::Read(ReadCompletion { job, data }))
-                                .is_err()
+                            // A queue that has stopped no longer collects its
+                            // completions; the other queues still use the pool.
+                            if request.completions.send(completion).is_ok()
+                                && let Err(e) = request.event.write(1)
                             {
-                                return;
-                            }
-                            if let Err(e) = event.write(1) {
-                                error!("failed to signal read completion: {e:?}");
+                                error!("failed to signal a pool completion: {e:?}");
                             }
                         }
                     })
@@ -205,22 +196,60 @@ impl IoPool {
             .collect();
         Self {
             jobs: Some(jobs),
-            completions,
-            event,
-            workers,
-            pending: 0,
+            threads,
         }
     }
 }
 
-impl Drop for IoPool {
+impl Drop for IoPoolThreads {
     fn drop(&mut self) {
         self.jobs.take();
-        for worker in self.workers.drain(..) {
-            if let Err(e) = worker.join() {
+        for thread in self.threads.drain(..) {
+            if let Err(e) = thread.join() {
                 error!("error waiting for pool worker thread: {e:?}");
             }
         }
+    }
+}
+
+/// One queue's use of the I/O pool: the completions of the requests it sent,
+/// and how many are in flight.
+struct IoPool {
+    threads: Arc<IoPoolThreads>,
+    sender: Sender<PoolCompletion>,
+    completions: Receiver<PoolCompletion>,
+    event: Arc<EventFd>,
+    pending: usize,
+}
+
+impl IoPool {
+    fn new(threads: Arc<IoPoolThreads>) -> Self {
+        let (sender, completions) = unbounded();
+        Self {
+            threads,
+            sender,
+            completions,
+            event: Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            pending: 0,
+        }
+    }
+
+    fn submit(&mut self, job: PoolJob) {
+        self.threads
+            .jobs
+            .as_ref()
+            .unwrap()
+            .send(PoolRequest {
+                job,
+                completions: self.sender.clone(),
+                event: self.event.clone(),
+            })
+            .unwrap();
+        self.pending += 1;
+    }
+
+    fn size(&self) -> usize {
+        self.threads.threads.len()
     }
 }
 
@@ -328,7 +357,7 @@ pub struct BlockWorker {
     stop_fd: EventFd,
     parallel_reads: bool,
     parallel_writes: bool,
-    pool_size: Option<NonZeroUsize>,
+    pool: Option<Arc<IoPoolThreads>>,
 }
 
 impl BlockWorker {
@@ -341,7 +370,7 @@ impl BlockWorker {
         stop_fd: EventFd,
         parallel_reads: bool,
         parallel_writes: bool,
-        pool_size: Option<NonZeroUsize>,
+        pool: Option<Arc<IoPoolThreads>>,
     ) -> Self {
         Self {
             device_queue,
@@ -351,7 +380,7 @@ impl BlockWorker {
             stop_fd,
             parallel_reads,
             parallel_writes,
-            pool_size,
+            pool,
         }
     }
 
@@ -365,15 +394,7 @@ impl BlockWorker {
     fn work(mut self) {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
-        let pool_size = if self.parallel_reads || self.parallel_writes {
-            resolve_pool_size(
-                self.pool_size,
-                thread::available_parallelism().ok().map(|n| n.get()),
-            )
-        } else {
-            None
-        };
-        let mut pool = pool_size.map(|size| IoPool::new(size, &self.disk, &self.mem));
+        let mut pool = self.pool.take().map(IoPool::new);
         let pool_completion_ev_fd = pool.as_ref().map(|pool| pool.event.as_raw_fd());
         let mut epoll = Epoll::new().unwrap();
 
@@ -423,12 +444,7 @@ impl BlockWorker {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
                                 if let Some(pool) = pool.as_mut() {
-                                    pool.jobs.take();
-                                    for completion in pool.completions.iter() {
-                                        let (head, len) = write_completion(&self.mem, completion);
-                                        self.add_used(head, len);
-                                    }
-                                    self.signal_used_queue();
+                                    self.drain_pool(pool);
                                 }
                                 return;
                             }
@@ -560,7 +576,7 @@ impl BlockWorker {
             && let Some(pool) = pool
         {
             self.process_pool_completions(pool);
-            if pool.pending == pool.workers.len() {
+            if pool.pending == pool.size() {
                 let completion = pool.completions.recv().unwrap();
                 pool.pending -= 1;
                 let (head, len) = write_completion(mem, completion);
@@ -576,18 +592,13 @@ impl BlockWorker {
                 return;
             }
             if let Some(permit) = ReadBufferPermit::try_acquire(data_len) {
-                pool.jobs
-                    .as_ref()
-                    .unwrap()
-                    .send(PoolJob::Read(ReadJob {
-                        head_index,
-                        sector: request_header.sector,
-                        data_len,
-                        buffers,
-                        _buffer_permit: permit,
-                    }))
-                    .unwrap();
-                pool.pending += 1;
+                pool.submit(PoolJob::Read(ReadJob {
+                    head_index,
+                    sector: request_header.sector,
+                    data_len,
+                    buffers,
+                    _buffer_permit: permit,
+                }));
                 return;
             }
         } else if request_header.request_type == VIRTIO_BLK_T_OUT
@@ -595,7 +606,7 @@ impl BlockWorker {
             && let Some(pool) = pool
         {
             self.process_pool_completions(pool);
-            if pool.pending == pool.workers.len() {
+            if pool.pending == pool.size() {
                 let completion = pool.completions.recv().unwrap();
                 pool.pending -= 1;
                 let (head, len) = write_completion(mem, completion);
@@ -617,18 +628,13 @@ impl BlockWorker {
                 .readable()
                 .map(|desc| (desc.addr, desc.len))
                 .collect();
-            pool.jobs
-                .as_ref()
-                .unwrap()
-                .send(PoolJob::Write(WriteJob {
-                    head_index,
-                    sector: request_header.sector,
-                    data_len,
-                    readable,
-                    writable: buffers,
-                }))
-                .unwrap();
-            pool.pending += 1;
+            pool.submit(PoolJob::Write(WriteJob {
+                head_index,
+                sector: request_header.sector,
+                data_len,
+                readable,
+                writable: buffers,
+            }));
             return;
         } else if matches!(
             request_header.request_type,
@@ -764,7 +770,7 @@ impl BlockWorker {
     }
 }
 
-fn resolve_pool_size(
+pub(crate) fn resolve_pool_size(
     requested: Option<NonZeroUsize>,
     available_parallelism: Option<usize>,
 ) -> Option<usize> {
@@ -881,7 +887,8 @@ mod tests {
                 false,
                 None,
             );
-            let mut pool = parallel.then(|| IoPool::new(2, &worker.disk, &mem));
+            let mut pool =
+                parallel.then(|| IoPool::new(Arc::new(IoPoolThreads::new(2, &worker.disk, &mem))));
             worker.dispatch_request(&mem, pool.as_mut(), head);
             if let Some(pool) = pool.as_mut()
                 && pool.pending != 0
@@ -913,23 +920,18 @@ mod tests {
             let disk = test_disk(direct_io);
             let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
             mem.write_slice(&[0xff; 513], GuestAddress(0x100)).unwrap();
-            let mut pool = IoPool::new(2, &disk, &mem);
+            let mut pool = IoPool::new(Arc::new(IoPoolThreads::new(2, &disk, &mem)));
             let completions = pool.completions.clone();
             for sector in 0..2 {
-                pool.jobs
-                    .as_ref()
-                    .unwrap()
-                    .send(PoolJob::Read(ReadJob {
-                        head_index: sector as u16,
-                        sector,
-                        data_len: 512,
-                        buffers: vec![(GuestAddress(0x100), 513)],
-                        _buffer_permit: ReadBufferPermit::try_acquire(512).unwrap(),
-                    }))
-                    .unwrap();
+                pool.submit(PoolJob::Read(ReadJob {
+                    head_index: sector as u16,
+                    sector,
+                    data_len: 512,
+                    buffers: vec![(GuestAddress(0x100), 513)],
+                    _buffer_permit: ReadBufferPermit::try_acquire(512).unwrap(),
+                }));
             }
             wait_for_completion(&pool);
-            pool.jobs.take();
             drop(pool);
 
             let mut data = [0; 513];
@@ -993,7 +995,7 @@ mod tests {
             true,
             None,
         );
-        let mut pool = IoPool::new(2, &worker.disk, &mem);
+        let mut pool = IoPool::new(Arc::new(IoPoolThreads::new(2, &worker.disk, &mem)));
         worker.dispatch_request(&mem, Some(&mut pool), head);
         assert_eq!(pool.pending, 1);
         wait_for_completion(&pool);
@@ -1058,7 +1060,7 @@ mod tests {
             true,
             None,
         );
-        let mut pool = IoPool::new(2, &worker.disk, &mem);
+        let mut pool = IoPool::new(Arc::new(IoPoolThreads::new(2, &worker.disk, &mem)));
         worker.dispatch_request(&mem, Some(&mut pool), head);
 
         assert_eq!(pool.pending, 0);
@@ -1069,6 +1071,32 @@ mod tests {
         let mut data = [0; 512];
         mem.read_slice(&mut data, GuestAddress(0x1010)).unwrap();
         assert_eq!(data, [0x11; 512]);
+    }
+
+    #[test]
+    fn queues_sharing_the_pool_get_their_own_completions() {
+        let disk = test_disk(false);
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let threads = Arc::new(IoPoolThreads::new(2, &disk, &mem));
+        let mut queues = [IoPool::new(threads.clone()), IoPool::new(threads)];
+        for (index, pool) in queues.iter_mut().enumerate() {
+            pool.submit(PoolJob::Read(ReadJob {
+                head_index: index as u16,
+                sector: index as u64,
+                data_len: 512,
+                buffers: vec![(GuestAddress(0x100 + 0x400 * index as u64), 513)],
+                _buffer_permit: ReadBufferPermit::try_acquire(512).unwrap(),
+            }));
+        }
+
+        for (index, pool) in queues.iter().enumerate() {
+            wait_for_completion(pool);
+            let Ok(PoolCompletion::Read(completion)) = pool.completions.recv() else {
+                panic!("queue {index} got no read completion");
+            };
+            assert_eq!(completion.job.head_index, index as u16);
+            assert!(pool.completions.try_recv().is_err());
+        }
     }
 
     #[test]

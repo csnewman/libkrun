@@ -1513,6 +1513,7 @@ pub struct BlockDevice {
     parallel_reads: bool,
     parallel_writes: bool,
     pool_size: Option<NonZeroUsize>,
+    num_queues: u16,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1534,6 +1535,7 @@ impl BlockDevice {
             parallel_reads: false,
             parallel_writes: false,
             pool_size: None,
+            num_queues: 1,
         })
     }
 
@@ -1582,6 +1584,18 @@ impl BlockDevice {
     pub fn set_parallel_writes(&mut self, enabled: bool) {
         self.parallel_writes = enabled;
     }
+
+    /// Set the number of request queues the device offers (VIRTIO_BLK_F_MQ), each served by
+    /// a worker thread of its own.
+    ///
+    /// Defaults to 1. Linux's driver uses at most one queue per vCPU; queues beyond that are
+    /// left unused, each with an idle worker thread. With parallel reads or writes enabled, the
+    /// queues share one I/O pool: more queues then help writes and direct I/O, but can slow
+    /// down cached reads.
+    /// 0 is taken as 1.
+    pub fn set_num_queues(&mut self, num_queues: u16) {
+        self.num_queues = num_queues.max(1);
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1603,6 +1617,7 @@ impl<'a> AttachDevice<'a> for BlockDevice {
             self.parallel_reads,
             self.parallel_writes,
             self.pool_size,
+            self.num_queues,
         )
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
 

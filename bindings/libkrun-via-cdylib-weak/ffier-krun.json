@@ -2070,6 +2070,31 @@
             "return_kind": "void"
           },
           "ffi_name": "krun_block_device_set_parallel_writes"
+        },
+        {
+          "name": "set_num_queues",
+          "doc": [
+            " Set the number of request queues the device offers (VIRTIO_BLK_F_MQ), each served by",
+            " a worker thread of its own.",
+            "",
+            " Defaults to 1. Linux's driver uses at most one queue per vCPU; queues beyond that are",
+            " left unused, each with an idle worker thread. With parallel reads or writes enabled, the",
+            " queues share one I/O pool: more queues then help writes and direct I/O, but can slow",
+            " down cached reads.",
+            " 0 is taken as 1."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "num_queues",
+              "param_kind": "regular",
+              "type": "u16"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_block_device_set_num_queues"
         }
       ],
       "cfg": "feature = \"blk\""
