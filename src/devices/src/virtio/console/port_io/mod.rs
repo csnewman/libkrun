@@ -26,7 +26,9 @@ pub trait PortInput {
 pub trait PortOutput {
     fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error>;
 
-    fn wait_until_writable(&self);
+    /// Block until the output can accept more, or until `stopfd` signals.
+    /// Returns true if it was `stopfd` that fired (the caller should stop).
+    fn wait_until_writable(&self, stopfd: Option<&EventFd>) -> bool;
 }
 
 /// Terminal properties associated with this port
@@ -88,7 +90,9 @@ impl PortOutput for PortOutputLog {
         Ok(buf.len())
     }
 
-    fn wait_until_writable(&self) {}
+    fn wait_until_writable(&self, _stopfd: Option<&EventFd>) -> bool {
+        false
+    }
 }
 
 pub struct PortInputEmpty {}
