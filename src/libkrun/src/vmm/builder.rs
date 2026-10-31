@@ -1131,7 +1131,8 @@ pub fn build_microvm(
         target_arch = "x86_64",
         any(target_os = "linux", target_os = "windows")
     ))]
-    let pci_device_manager = if pci_enabled {
+    #[allow(unused_mut)]
+    let mut pci_device_manager = if pci_enabled {
         Some(device_manager::pci::PciHostManager::new(
             irq_allocator.clone(),
         ))
@@ -1185,6 +1186,12 @@ pub fn build_microvm(
             Box::new(KvmIoapic::new(vm.fd()).map_err(StartMicrovmError::CreateKvmIrqChip)?)
         };
         intc = Arc::new(Mutex::new(IrqChipDevice::new(ioapic)));
+
+        if !vm_resources.split_irqchip
+            && let Some(pci) = pci_device_manager.as_mut()
+        {
+            pci.enable_msi(vm.fd_shared());
+        }
 
         attach_legacy_devices(
             &vm,

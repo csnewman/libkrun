@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use devices::Bus;
 use devices::pci::{
-    BarWindow, ConfigMechanism1, Ecam, PciAddress, PciFunction, PciIntxLine, PciQueueNotifications,
-    PciRootError,
+    BarWindow, ConfigMechanism1, Ecam, PciAddress, PciFunction, PciIntxLine, PciMsiVectors,
+    PciQueueNotifications, PciRootError,
 };
 use devices::virtio::{
     CreatePciTransportError, VIRTIO_PCI_BAR0_SIZE, VirtioDevice, VirtioPciTransport,
@@ -29,6 +29,8 @@ pub enum Error {
     CreateTransport(CreatePciTransportError),
     IrqsExhausted,
     PciRoot(PciRootError),
+    EventFd(io::Error),
+    RegisterIrqFd(kvm_ioctls::Error),
 }
 
 impl Display for Error {
@@ -38,6 +40,8 @@ impl Display for Error {
             Self::CreateTransport(err) => write!(f, "failed to create virtio-pci transport: {err}"),
             Self::IrqsExhausted => write!(f, "no more GSIs are available for PCI INTx"),
             Self::PciRoot(err) => write!(f, "failed to register PCI function: {err}"),
+            Self::EventFd(err) => write!(f, "failed to create an MSI-X eventfd: {err}"),
+            Self::RegisterIrqFd(err) => write!(f, "failed to register an MSI-X irqfd: {err}"),
         }
     }
 }
@@ -50,6 +54,8 @@ pub struct PciHostManager {
     next_device: u8,
     irqs: IrqAllocator,
     functions: Vec<arch::x86_64::PciFunctionInfo>,
+    msi: Option<Arc<msi::MsiRouter>>,
+    next_msi_gsi: u32,
 }
 
 struct KvmPciIntxLine {
@@ -99,7 +105,16 @@ impl PciHostManager {
             next_device: 1,
             irqs,
             functions: Vec::new(),
+            msi: None,
+            next_msi_gsi: msi::MSI_GSI_BASE,
         }
+    }
+
+    /// Enables MSI-X, delivered by KVM's in-kernel irqchip, for the functions
+    /// added after this call. Not for a split irqchip, whose userspace IOAPIC
+    /// owns KVM's routing table: its functions keep INTx.
+    pub fn enable_msi(&mut self, vm: Arc<VmFd>) {
+        self.msi = Some(Arc::new(msi::MsiRouter::new(vm)));
     }
 
     pub fn register_config_io(&self, bus: &mut Bus) -> Result<()> {
@@ -150,13 +165,24 @@ impl PciHostManager {
             vm: vm.clone(),
             gsi: irq,
         });
+        let msix_vectors: Option<Arc<dyn PciMsiVectors>> = match &self.msi {
+            Some(router) => {
+                // One for the configuration, and one for each queue.
+                let count = device.lock().unwrap().queue_config().len() as u32 + 1;
+                let vectors =
+                    msi::KvmMsiVectors::new(&vm, router.clone(), self.next_msi_gsi, count)?;
+                self.next_msi_gsi += count;
+                Some(Arc::new(vectors))
+            }
+            None => None,
+        };
         let mut transport = VirtioPciTransport::new(
             guest_memory,
             device,
             irq as u8,
             intx_line,
             bar_base as u32,
-            None,
+            msix_vectors,
         )
         .map_err(Error::CreateTransport)?;
         let events = transport.queue_notify_events();
@@ -185,6 +211,154 @@ impl PciHostManager {
             bar_start: arch::x86_64::layout::PCI_BAR_START,
             bar_size: arch::x86_64::layout::PCI_BAR_END - arch::x86_64::layout::PCI_BAR_START,
             functions: self.functions.clone(),
+        }
+    }
+}
+
+/// MSI-X delivery through KVM: one router owns the GSI routing table for all
+/// functions, and each function has its own vectors.
+mod msi {
+    use std::collections::BTreeMap;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use devices::pci::PciMsiVectors;
+    use kvm_bindings::{
+        KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
+        KVM_IRQCHIP_PIC_SLAVE, KvmIrqRouting, kvm_irq_routing_entry,
+        kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip, kvm_irq_routing_msi,
+    };
+    use kvm_ioctls::VmFd;
+    use utils::eventfd::{EFD_NONBLOCK, EventFd};
+
+    use super::{Error, Result};
+
+    /// The first GSI for MSIs, after the IOAPIC's 24 pins.
+    pub const MSI_GSI_BASE: u32 = 24;
+
+    fn irqchip_route(gsi: u32, irqchip: u32, pin: u32) -> kvm_irq_routing_entry {
+        kvm_irq_routing_entry {
+            gsi,
+            type_: KVM_IRQ_ROUTING_IRQCHIP,
+            u: kvm_irq_routing_entry__bindgen_ty_1 {
+                irqchip: kvm_irq_routing_irqchip { irqchip, pin },
+            },
+            ..Default::default()
+        }
+    }
+
+    /// KVM's default routes for the in-kernel irqchip, which setting the
+    /// table would otherwise drop: the IOAPIC's 24 pins, and the two PICs'
+    /// 8 pins each for the first 16.
+    fn default_routes() -> Vec<kvm_irq_routing_entry> {
+        let mut routes = Vec::new();
+        for gsi in 0..24 {
+            if gsi < 16 {
+                let pic = if gsi < 8 {
+                    KVM_IRQCHIP_PIC_MASTER
+                } else {
+                    KVM_IRQCHIP_PIC_SLAVE
+                };
+                routes.push(irqchip_route(gsi, pic, gsi % 8));
+            }
+            routes.push(irqchip_route(gsi, KVM_IRQCHIP_IOAPIC, gsi));
+        }
+        routes
+    }
+
+    /// KVM's GSI routing table: the default routes, plus an MSI route for
+    /// each vector the guest has programmed. KVM replaces the whole table on
+    /// each update, so all of it is kept here.
+    pub struct MsiRouter {
+        vm: Arc<VmFd>,
+        routes: Mutex<BTreeMap<u32, kvm_irq_routing_entry>>,
+    }
+
+    impl MsiRouter {
+        pub fn new(vm: Arc<VmFd>) -> Self {
+            Self {
+                vm,
+                routes: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        /// Routes `gsi` to the MSI message (address, data), or removes its
+        /// route with `None`.
+        fn set(&self, gsi: u32, message: Option<(u64, u32)>) -> io::Result<()> {
+            let mut routes = self.routes.lock().unwrap();
+            match message {
+                Some((address, data)) => {
+                    routes.insert(
+                        gsi,
+                        kvm_irq_routing_entry {
+                            gsi,
+                            type_: KVM_IRQ_ROUTING_MSI,
+                            u: kvm_irq_routing_entry__bindgen_ty_1 {
+                                msi: kvm_irq_routing_msi {
+                                    address_lo: address as u32,
+                                    address_hi: (address >> 32) as u32,
+                                    data,
+                                    ..Default::default()
+                                },
+                            },
+                            ..Default::default()
+                        },
+                    );
+                }
+                None => {
+                    routes.remove(&gsi);
+                }
+            }
+            let mut entries = default_routes();
+            entries.extend(routes.values().copied());
+            let routing = KvmIrqRouting::from_entries(&entries)
+                .map_err(|_| io::Error::other("too many interrupt routes"))?;
+            self.vm
+                .set_gsi_routing(&routing)
+                .map_err(|err| io::Error::from_raw_os_error(err.errno()))
+        }
+    }
+
+    /// A function's MSI-X vectors: one GSI each from `gsi_base`, signalled
+    /// through an irqfd and routed by the router.
+    pub struct KvmMsiVectors {
+        router: Arc<MsiRouter>,
+        gsi_base: u32,
+        events: Vec<EventFd>,
+    }
+
+    impl KvmMsiVectors {
+        pub fn new(vm: &VmFd, router: Arc<MsiRouter>, gsi_base: u32, count: u32) -> Result<Self> {
+            let events = (0..count)
+                .map(|vector| {
+                    let event = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?;
+                    vm.register_irqfd(&event, gsi_base + vector)
+                        .map_err(Error::RegisterIrqFd)?;
+                    Ok(event)
+                })
+                .collect::<Result<_>>()?;
+            Ok(Self {
+                router,
+                gsi_base,
+                events,
+            })
+        }
+    }
+
+    impl PciMsiVectors for KvmMsiVectors {
+        fn count(&self) -> u16 {
+            self.events.len() as u16
+        }
+
+        fn route(&self, vector: u16, message: Option<(u64, u32)>) -> io::Result<()> {
+            self.router.set(self.gsi_base + u32::from(vector), message)
+        }
+
+        fn signal(&self, vector: u16) -> io::Result<()> {
+            match self.events.get(usize::from(vector)) {
+                Some(event) => event.write(1),
+                None => Ok(()),
+            }
         }
     }
 }
