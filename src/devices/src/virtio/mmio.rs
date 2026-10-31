@@ -9,10 +9,11 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::device::{InterruptHandler, InterruptType, VirtioTransportState};
+use super::device::{InterruptHandler, InterruptType, SavedTransport, VirtioTransportState};
 use super::*;
 use crate::bus::BusDevice;
 use crate::legacy::IrqChip;
+use crate::snapshot::{SavedState, Snapshottable};
 use utils::{byte_order, eventfd::EventFd};
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
@@ -130,6 +131,10 @@ impl MmioInterrupt {
 
     fn reset_status(&self) {
         *self.0.status.lock().unwrap() = 0;
+    }
+
+    fn set_status(&self, status: usize) {
+        *self.0.status.lock().unwrap() = status;
     }
 
     /// Must be called whenever the guest writes to VIRTIO_MMIO_INTERRUPT_ACK,
@@ -412,6 +417,57 @@ impl BusDevice for MmioTransport {
         // write() is safe to unwrap because the inner syscall is tailored to be safe as well.
         self.interrupt.event().write(1).unwrap();
         Ok(())
+    }
+}
+
+const MMIO_SNAPSHOT_VERSION: u8 = 1;
+
+#[derive(bincode::Encode, bincode::Decode)]
+struct SavedMmio {
+    transport: SavedTransport,
+    shm_region_select: u32,
+    // An interrupt the guest hasn't acknowledged must survive, or its handler
+    // reads a clear status and never reaps the ring.
+    interrupt_status: u64,
+}
+
+impl Snapshottable for MmioTransport {
+    fn pause(&mut self) -> Result<(), crate::Error> {
+        self.state.pause()
+    }
+
+    fn save(&self) -> Result<SavedState, crate::Error> {
+        let saved = SavedMmio {
+            transport: self.state.save()?,
+            shm_region_select: self.shm_region_select,
+            interrupt_status: self.interrupt.status() as u64,
+        };
+        let bytes = bincode::encode_to_vec(&saved, bincode::config::standard())
+            .map_err(|e| crate::Error::Snapshot(e.to_string()))?;
+        Ok(SavedState {
+            version: MMIO_SNAPSHOT_VERSION,
+            bytes,
+        })
+    }
+
+    fn restore(&mut self, state: &SavedState) -> Result<(), crate::Error> {
+        if state.version != MMIO_SNAPSHOT_VERSION {
+            return Err(crate::Error::Snapshot(format!(
+                "virtio-mmio: unsupported state version {}",
+                state.version
+            )));
+        }
+        let (saved, _): (SavedMmio, _) =
+            bincode::decode_from_slice(&state.bytes, bincode::config::standard())
+                .map_err(|e| crate::Error::Snapshot(format!("virtio-mmio: {e}")))?;
+        self.state.restore(&saved.transport)?;
+        self.shm_region_select = saved.shm_region_select;
+        self.interrupt.set_status(saved.interrupt_status as usize);
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), crate::Error> {
+        self.state.resume(self.device_interrupt.clone())
     }
 }
 

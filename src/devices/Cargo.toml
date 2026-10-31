@@ -24,6 +24,7 @@ vhost-user = ["vhost", "vmm-sys-util", "krun_display"]
 ffi = ["dep:ffier"]
 
 [dependencies]
+bincode = { version = "2.0.1", default-features = false, features = ["std", "derive"] }
 bitflags = "1.2.0"
 crossbeam-channel = ">=0.5.15"
 ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "0.2.0rc1", optional = true }
