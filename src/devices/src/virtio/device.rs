@@ -5,11 +5,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use std::fmt;
 use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::{ActivateResult, Queue, device_status};
+use super::{ActivateResult, Queue, QueueSnapshot, device_status};
 use crate::virtio::AsAny;
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -124,6 +125,22 @@ pub(crate) struct VirtioTransportState {
     queue_evts: Vec<Arc<EventFd>>,
     pub(crate) queue_config: Vec<QueueConfig>,
     bus_master_gate: Option<Arc<AtomicBool>>,
+    // Live queues a paused device handed back, until it resumes.
+    paused_queues: Option<Vec<DeviceQueue>>,
+}
+
+/// The transport state both virtio transports save in a snapshot.
+#[derive(bincode::Encode, bincode::Decode)]
+pub(crate) struct SavedTransport {
+    features_select: u32,
+    acked_features_select: u32,
+    queue_select: u32,
+    device_status: u32,
+    config_generation: u32,
+    acked_features: u64,
+    queues: Vec<QueueSnapshot>,
+    // Opaque device-specific state (see `VirtioDevice::save_state`).
+    device: Vec<u8>,
 }
 
 impl VirtioTransportState {
@@ -151,6 +168,7 @@ impl VirtioTransportState {
             queue_evts,
             queue_config,
             bus_master_gate: None,
+            paused_queues: None,
         })
     }
 
@@ -256,6 +274,126 @@ impl VirtioTransportState {
         locked_device
             .activate(self.mem.clone(), interrupt, device_queues)
             .expect("Failed to activate device");
+    }
+
+    /// Stops an activated device's workers and keeps its live queues, so
+    /// [`VirtioTransportState::save`] can read them.
+    pub(crate) fn pause(&mut self) -> std::result::Result<(), crate::Error> {
+        if self.paused_queues.is_some() || !self.locked_device().is_activated() {
+            return Ok(());
+        }
+        let queues = self
+            .locked_device()
+            .pause()
+            .map_err(|e| crate::Error::Snapshot(e.to_string()))?;
+        self.paused_queues = Some(queues);
+        Ok(())
+    }
+
+    pub(crate) fn save(&self) -> std::result::Result<SavedTransport, crate::Error> {
+        let queues = if self.locked_device().is_activated() {
+            let Some(paused) = &self.paused_queues else {
+                return Err(crate::Error::Snapshot(
+                    "save before pause; the device's workers still own the queues".into(),
+                ));
+            };
+            paused.iter().map(|dq| dq.queue.snapshot()).collect()
+        } else {
+            self.queues
+                .iter()
+                .flatten()
+                .map(|queue| queue.snapshot())
+                .collect()
+        };
+        let acked_features = self.locked_device().acked_features();
+        let device = self.locked_device().save_state();
+        Ok(SavedTransport {
+            features_select: self.features_select,
+            acked_features_select: self.acked_features_select,
+            queue_select: self.queue_select,
+            device_status: self.device_status,
+            config_generation: self.config_generation,
+            acked_features,
+            queues,
+            device,
+        })
+    }
+
+    /// Loads saved transport state into a transport that hasn't been activated.
+    /// A device the guest had activated keeps its queues aside, stopped, until
+    /// [`VirtioTransportState::resume`].
+    pub(crate) fn restore(
+        &mut self,
+        saved: &SavedTransport,
+    ) -> std::result::Result<(), crate::Error> {
+        if saved.queues.len() != self.queue_config.len() {
+            return Err(crate::Error::Snapshot(format!(
+                "snapshot has {} queues, device has {}",
+                saved.queues.len(),
+                self.queue_config.len()
+            )));
+        }
+        let mut queues = Self::create_queues(&self.queue_config);
+        for (queue, snapshot) in queues.iter_mut().zip(&saved.queues) {
+            queue.restore(snapshot);
+            if let Some(gate) = &self.bus_master_gate {
+                queue.set_bus_master_gate(gate.clone());
+            }
+        }
+        // Ring addresses come from the snapshot, and workers unwrap their
+        // accesses to guest memory, so check them before any worker runs.
+        if queues.iter().any(|q| q.ready && !q.is_valid(&self.mem)) {
+            return Err(crate::Error::Snapshot(
+                "restored queue failed validation".into(),
+            ));
+        }
+
+        self.features_select = saved.features_select;
+        self.acked_features_select = saved.acked_features_select;
+        self.queue_select = saved.queue_select;
+        self.device_status = saved.device_status;
+        self.config_generation = saved.config_generation;
+        self.locked_device()
+            .set_acked_features(saved.acked_features);
+        self.locked_device().restore_state(&saved.device)?;
+
+        if saved.device_status & device_status::DRIVER_OK != 0 {
+            self.queues = None;
+            self.paused_queues = Some(
+                queues
+                    .into_iter()
+                    .zip(self.queue_evts.iter().cloned())
+                    .map(|(queue, event)| DeviceQueue::new(queue, event))
+                    .collect(),
+            );
+        } else {
+            self.queues = Some(queues);
+        }
+        Ok(())
+    }
+
+    /// Restarts a device stopped by [`VirtioTransportState::pause`] or loaded
+    /// by [`VirtioTransportState::restore`].
+    pub(crate) fn resume(
+        &mut self,
+        interrupt: InterruptTransport,
+    ) -> std::result::Result<(), crate::Error> {
+        let Some(queues) = self.paused_queues.take() else {
+            return Ok(());
+        };
+        // A descriptor the guest made available but no worker had consumed
+        // left no notification behind on a restored transport's new eventfds.
+        let waiting: Vec<bool> = queues
+            .iter()
+            .map(|dq| dq.queue.ready && dq.queue.len(&self.mem) > 0)
+            .collect();
+        self.locked_device()
+            .resume(self.mem.clone(), interrupt, queues)
+            .map_err(|e| crate::Error::Snapshot(format!("device resume: {e:?}")))?;
+        for (event, _) in self.queue_evts.iter().zip(waiting).filter(|(_, w)| *w) {
+            let _ = event.write(1);
+        }
+        Ok(())
     }
 
     pub(crate) fn set_device_status(
@@ -440,6 +578,56 @@ pub trait VirtioDevice: AsAny + Send {
     /// Get base and size of the SHM region
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None
+    }
+
+    /// Stop this device's workers and hand its live queues back for snapshot.
+    /// The workers own the running queue indices, so the transport cannot read
+    /// them until they stop. The default rejects the snapshot.
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        Err(PauseError::Unsupported(self.device_name().to_string()))
+    }
+
+    /// Device state beyond the queues (e.g. the console's open ports, which a
+    /// restored guest won't re-announce). Captured after [`VirtioDevice::pause`].
+    fn save_state(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Load what [`VirtioDevice::save_state`] wrote, before [`VirtioDevice::resume`].
+    fn restore_state(&mut self, _state: &[u8]) -> std::result::Result<(), crate::Error> {
+        Ok(())
+    }
+
+    /// Restart this device with `queues`, in place of [`VirtioDevice::activate`].
+    /// The default re-activates; override when resume differs from a fresh
+    /// activation (the console restarts only the ports the guest had open).
+    fn resume(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        self.activate(mem, interrupt, queues)
+    }
+}
+
+/// Why a device could not be quiesced for a snapshot.
+#[derive(Debug)]
+pub enum PauseError {
+    /// The device has no quiesce support, so it cannot be snapshotted.
+    Unsupported(String),
+    /// The device tried to stop its workers and failed.
+    Failed(String),
+}
+
+impl fmt::Display for PauseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            PauseError::Unsupported(name) => {
+                write!(f, "{name} can't be paused for a snapshot")
+            }
+            PauseError::Failed(e) => write!(f, "pausing failed: {e}"),
+        }
     }
 }
 
