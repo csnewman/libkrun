@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
-use devices::DeviceType;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt::DeviceInfoForFDT;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::legacy::IrqChip;
+use devices::{DeviceType, Snapshottable};
 use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};
 #[cfg(target_arch = "aarch64")]
@@ -91,6 +91,7 @@ pub struct MMIODeviceManager {
     mmio_base: u64,
     irqs: IrqAllocator,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    snapshottables: Vec<(String, Arc<Mutex<dyn Snapshottable>>)>,
 }
 
 impl MMIODeviceManager {
@@ -104,7 +105,13 @@ impl MMIODeviceManager {
             irqs,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            snapshottables: Vec::new(),
         }
+    }
+
+    /// The devices with state for a snapshot, in registration order.
+    pub fn snapshottables(&self) -> &[(String, Arc<Mutex<dyn Snapshottable>>)] {
+        &self.snapshottables
     }
 
     /// Register a MMIO IOAPIC device.
@@ -148,9 +155,11 @@ impl MMIODeviceManager {
 
         mmio_device.set_irq_line(irq);
 
+        let mmio_device = Arc::new(Mutex::new(mmio_device));
         self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
+            .insert(mmio_device.clone(), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
+        self.snapshottables.push((device_id.clone(), mmio_device));
         let ret = (self.mmio_base, irq);
         self.id_to_dev_info.insert(
             (DeviceType::Virtio(type_id), device_id),
@@ -246,9 +255,11 @@ impl MMIODeviceManager {
         vm.register_irqfd(&rtc_evt, irq)
             .map_err(Error::RegisterIrqFd)?;
 
+        let device = Arc::new(Mutex::new(device));
         self.bus
-            .insert(Arc::new(Mutex::new(device)), self.mmio_base, MMIO_LEN)
+            .insert(device.clone(), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
+        self.snapshottables.push(("rtc".to_string(), device));
 
         let ret = self.mmio_base;
         self.id_to_dev_info.insert(
