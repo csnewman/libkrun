@@ -583,7 +583,10 @@ impl Vmm {
     /// ITS's when there is one.
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     fn save_irqchip(&self) -> std::result::Result<Vec<u8>, String> {
-        let its: Option<Vec<u8>> = None;
+        let its = match &self.pci_device_manager {
+            Some(pci) => pci.save_its()?,
+            None => None,
+        };
         let gic = self
             .intc
             .lock()
