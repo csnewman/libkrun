@@ -23,6 +23,8 @@ const GIC_PHANDLE: u32 = 1;
 const CLOCK_PHANDLE: u32 = 2;
 // This is a value for uniquely identifying the FDT node containing the gpio controller.
 const GPIO_PHANDLE: u32 = 4;
+// The GIC ITS, which turns PCI functions' MSIs into interrupts.
+const ITS_PHANDLE: u32 = 5;
 // Read the documentation specified when appending the root node to the FDT.
 const ADDRESS_CELLS: u32 = 0x2;
 const SIZE_CELLS: u32 = 0x2;
@@ -68,7 +70,30 @@ impl From<FdtError> for Error {
     }
 }
 
+/// A PCI function on bus 0, as the device tree describes it.
+#[derive(Clone, Copy, Debug)]
+pub struct PciFdtFunction {
+    pub device: u8,
+    /// The SPI its INTA line is wired to, numbered like the MMIO devices'
+    /// interrupts.
+    pub irq: u32,
+}
+
+/// The PCI host bridge, for the device tree.
+#[derive(Clone, Debug)]
+pub struct PciFdtInfo {
+    pub ecam_base: u64,
+    pub ecam_size: u64,
+    pub bar_base: u64,
+    pub bar_size: u64,
+    pub functions: Vec<PciFdtFunction>,
+    /// The address and size of the GIC ITS, if functions send their MSIs
+    /// through it. A function's requester ID is its ITS device ID.
+    pub its: Option<(u64, u64)>,
+}
+
 /// Creates the flattened device tree for this aarch64 microVM.
+#[allow(clippy::too_many_arguments)]
 pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     guest_mem: &GuestMemoryMmap,
     arch_memory_info: &ArchMemoryInfo,
@@ -77,6 +102,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     device_info: &HashMap<(DeviceType, String), T>,
     gic_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
+    pci: Option<&PciFdtInfo>,
 ) -> Result<Vec<u8>> {
     // Alocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -97,12 +123,15 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
     create_cpu_nodes(&mut fdt, &vcpu_mpidr)?;
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
-    create_chosen_node(&mut fdt, cmdline, initrd, device_info)?;
-    create_gic_node(&mut fdt, gic_device)?;
+    create_chosen_node(&mut fdt, cmdline, initrd, device_info, pci.is_some())?;
+    create_gic_node(&mut fdt, gic_device, pci.and_then(|pci| pci.its))?;
     create_timer_node(&mut fdt)?;
     create_clock_node(&mut fdt)?;
     create_psci_node(&mut fdt)?;
     create_devices_node(&mut fdt, device_info)?;
+    if let Some(pci) = pci {
+        create_pci_node(&mut fdt, pci)?;
+    }
 
     // End Header node.
     fdt.end_node(root_node)?;
@@ -193,9 +222,15 @@ fn create_chosen_node<T: DeviceInfoForFDT + Clone + Debug>(
     cmdline: &str,
     initrd: &Option<InitrdConfig>,
     dev_info: &HashMap<(DeviceType, String), T>,
+    pci: bool,
 ) -> Result<()> {
     let chosen_node = fdt.begin_node("chosen")?;
     fdt.property_string("bootargs", cmdline)?;
+    // libkrun assigns every BAR itself, so the guest keeps them where they
+    // are.
+    if pci {
+        fdt.property_u32("linux,pci-probe-only", 1)?;
+    }
 
     // If we have a legacy serial device, tell the guest this is the default console.
     // Clever guests will still switch to a better console (like virtio-console) if
@@ -219,7 +254,11 @@ fn create_chosen_node<T: DeviceInfoForFDT + Clone + Debug>(
     Ok(())
 }
 
-fn create_gic_node(fdt: &mut FdtWriter, gic_device: &IrqChip) -> Result<()> {
+fn create_gic_node(
+    fdt: &mut FdtWriter,
+    gic_device: &IrqChip,
+    its: Option<(u64, u64)>,
+) -> Result<()> {
     let gic_device = gic_device.lock().unwrap();
     let gic_reg_prop = generate_prop64(&gic_device.device_properties());
 
@@ -243,6 +282,15 @@ fn create_gic_node(fdt: &mut FdtWriter, gic_device: &IrqChip) -> Result<()> {
     let gic_intr_prop = generate_prop32(&gic_intr);
 
     fdt.property("interrupts", &gic_intr_prop)?;
+    if let Some((addr, size)) = its {
+        let its_node = fdt.begin_node(&format!("msic@{addr:x}"))?;
+        fdt.property_string("compatible", "arm,gic-v3-its")?;
+        fdt.property_null("msi-controller")?;
+        fdt.property_u32("#msi-cells", 1)?;
+        fdt.property("reg", &generate_prop64(&[addr, size]))?;
+        fdt.property_u32("phandle", ITS_PHANDLE)?;
+        fdt.end_node(its_node)?;
+    }
     fdt.end_node(intc_node)?;
 
     Ok(())
@@ -325,6 +373,59 @@ fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
     fdt.end_node(virtio_node)?;
 
+    Ok(())
+}
+
+// The PCI address space of the BAR window: 32-bit memory.
+const PCI_SPACE_MEM32: u32 = 0x0200_0000;
+const PCI_INTERRUPT_PIN_INTA: u32 = 1;
+
+fn create_pci_node(fdt: &mut FdtWriter, pci: &PciFdtInfo) -> Result<()> {
+    let node = fdt.begin_node(&format!("pcie@{:x}", pci.ecam_base))?;
+    fdt.property_string("compatible", "pci-host-ecam-generic")?;
+    fdt.property_string("device_type", "pci")?;
+    fdt.property_u32("#address-cells", 3)?;
+    fdt.property_u32("#size-cells", 2)?;
+    fdt.property_u32("#interrupt-cells", 1)?;
+    fdt.property("reg", &generate_prop64(&[pci.ecam_base, pci.ecam_size]))?;
+    fdt.property("bus-range", &generate_prop32(&[0, 0]))?;
+    fdt.property_null("dma-coherent")?;
+    // One window for the BARs, at the same address for PCI and the CPU.
+    fdt.property(
+        "ranges",
+        &generate_prop32(&[
+            PCI_SPACE_MEM32,
+            (pci.bar_base >> 32) as u32,
+            pci.bar_base as u32,
+            (pci.bar_base >> 32) as u32,
+            pci.bar_base as u32,
+            (pci.bar_size >> 32) as u32,
+            pci.bar_size as u32,
+        ]),
+    )?;
+    // Map each device's INTA to its SPI.
+    fdt.property("interrupt-map-mask", &generate_prop32(&[0xf800, 0, 0, 7]))?;
+    let mut map = Vec::new();
+    for function in &pci.functions {
+        map.extend_from_slice(&[
+            u32::from(function.device) << 11,
+            0,
+            0,
+            PCI_INTERRUPT_PIN_INTA,
+            GIC_PHANDLE,
+            0,
+            0,
+            GIC_FDT_IRQ_TYPE_SPI,
+            function.irq,
+            IRQ_TYPE_LEVEL_HI,
+        ]);
+    }
+    fdt.property("interrupt-map", &generate_prop32(&map))?;
+    // A function's requester ID is its ITS device ID.
+    if pci.its.is_some() {
+        fdt.property("msi-map", &generate_prop32(&[0, ITS_PHANDLE, 0, 0x1_0000]))?;
+    }
+    fdt.end_node(node)?;
     Ok(())
 }
 

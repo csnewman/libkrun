@@ -849,7 +849,7 @@ impl Vm {
         self.fd.as_ref()
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn fd_shared(&self) -> Arc<VmFd> {
         self.fd.clone()
     }

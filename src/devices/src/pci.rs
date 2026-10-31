@@ -94,6 +94,25 @@ pub trait PciIntxLine: Send + Sync {
     fn set_level(&self, asserted: bool) -> io::Result<()>;
 }
 
+/// Handles a function's queue notifications outside the transport, e.g. as
+/// KVM ioeventfds.
+pub trait PciQueueNotifications: Send + Sync {
+    /// Moves the notify addresses from BAR0 at `from` to BAR0 at `to`.
+    /// `None` means not registered: notifications go through the transport.
+    fn relocate(&self, from: Option<u64>, to: Option<u64>) -> io::Result<()>;
+}
+
+/// Delivers a PCI function's MSI-X interrupts, e.g. through KVM.
+pub trait PciMsiVectors: Send + Sync {
+    /// The number of vectors.
+    fn count(&self) -> u16;
+    /// Sets the message (address, data) that `vector` is delivered as, or
+    /// stops delivering it with `None`.
+    fn route(&self, vector: u16, message: Option<(u64, u32)>) -> io::Result<()>;
+    /// Signals `vector`.
+    fn signal(&self, vector: u16) -> io::Result<()>;
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum PciRootError {
     DuplicateFunction(PciAddress),
