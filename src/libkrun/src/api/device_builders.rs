@@ -41,7 +41,7 @@ use devices::virtio::block::{DiskFormat, SyncMode};
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use devices::virtio::fs::{CachePolicy, PermissionSemantics};
-#[cfg(all(target_os = "linux", not(feature = "tee")))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
 use devices::virtio::mem;
 use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
 #[cfg(feature = "input")]
@@ -235,7 +235,7 @@ impl<'a> AttachContext<'a> {
 
     /// The resolved region of hotpluggable memory, if a region was allocated
     /// based on [`DeviceRequirements::hotplug_mem`].
-    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
     pub fn resolved_hotplug_region(&self) -> Option<ResolvedShmRegion> {
         self.shm_manager.hotplug_region().map(|r| {
             let host_addr = self
@@ -1475,18 +1475,20 @@ impl<'a> AttachDevice<'a> for RtcDevice {
 /// until [`MemDeviceHandle::set_requested_mib`] asks it to plug some in.
 ///
 /// The guest kernel must have a virtio-mem driver.
-#[cfg(all(target_os = "linux", not(feature = "tee")))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
 pub struct MemDevice {
     inner: Arc<Mutex<devices::virtio::Mem>>,
 }
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "all(target_os = \"linux\", not(feature = \"tee\"))")
+    ffier::export(
+        cfg = "all(any(target_os = \"linux\", target_os = \"macos\"), not(feature = \"tee\"))"
+    )
 )]
 #[cfg_attr(
     not(feature = "ffi"),
-    cfg(all(target_os = "linux", not(feature = "tee")))
+    cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))
 )]
 impl MemDevice {
     /// A device that can give the guest up to `region_mib` MiB of memory on
@@ -1512,11 +1514,13 @@ impl MemDevice {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "all(target_os = \"linux\", not(feature = \"tee\"))")
+    ffier::export(
+        cfg = "all(any(target_os = \"linux\", target_os = \"macos\"), not(feature = \"tee\"))"
+    )
 )]
 #[cfg_attr(
     not(feature = "ffi"),
-    cfg(all(target_os = "linux", not(feature = "tee")))
+    cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))
 )]
 impl<'a> AttachDevice<'a> for MemDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
@@ -1532,10 +1536,12 @@ impl<'a> AttachDevice<'a> for MemDevice {
         let region = ctx
             .resolved_hotplug_region()
             .ok_or_else(|| VmmError::Internal("mem: no hotplug region".into()))?;
-        self.inner
-            .lock()
-            .unwrap()
-            .set_region(region.guest_addr, region.host_addr as usize);
+        {
+            let mut mem = self.inner.lock().unwrap();
+            mem.set_region(region.guest_addr, region.host_addr as usize);
+            #[cfg(target_os = "macos")]
+            mem.set_map_sender(ctx.map_sender().expect("macOS requires map_sender"));
+        }
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("mem", self.inner)
     }
@@ -1543,7 +1549,7 @@ impl<'a> AttachDevice<'a> for MemDevice {
 
 /// Changes how much of a [`MemDevice`]'s region the guest has, from any
 /// thread, while the VM runs.
-#[cfg(all(target_os = "linux", not(feature = "tee")))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
 #[derive(Clone)]
 pub struct MemDeviceHandle {
     inner: Arc<Mutex<devices::virtio::Mem>>,
@@ -1551,11 +1557,13 @@ pub struct MemDeviceHandle {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "all(target_os = \"linux\", not(feature = \"tee\"))")
+    ffier::export(
+        cfg = "all(any(target_os = \"linux\", target_os = \"macos\"), not(feature = \"tee\"))"
+    )
 )]
 #[cfg_attr(
     not(feature = "ffi"),
-    cfg(all(target_os = "linux", not(feature = "tee")))
+    cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))
 )]
 impl MemDeviceHandle {
     /// Asks the guest to plug in or unplug memory until it has `mib` MiB of

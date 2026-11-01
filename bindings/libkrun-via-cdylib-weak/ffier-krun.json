@@ -1931,7 +1931,7 @@
           "ffi_name": "krun_mem_device_handle"
         }
       ],
-      "cfg": "all(target_os = \"linux\", not(feature = \"tee\"))"
+      "cfg": "all(any(target_os = \"linux\", target_os = \"macos\"), not(feature = \"tee\"))"
     },
     {
       "name": "MemDeviceHandle",
@@ -1989,7 +1989,7 @@
           "ffi_name": "krun_mem_device_handle_plugged_mib"
         }
       ],
-      "cfg": "all(target_os = \"linux\", not(feature = \"tee\"))"
+      "cfg": "all(any(target_os = \"linux\", target_os = \"macos\"), not(feature = \"tee\"))"
     },
     {
       "name": "VsockDevice",
@@ -3528,7 +3528,7 @@
         "a"
       ],
       "methods": [],
-      "cfg": "all(target_os = \"linux\", not(feature = \"tee\"))"
+      "cfg": "all(any(target_os = \"linux\", target_os = \"macos\"), not(feature = \"tee\"))"
     },
     {
       "trait_name": "AttachDevice",
