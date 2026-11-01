@@ -34,7 +34,8 @@ use krun_display::Rect;
 /// What the device asks of a running worker.
 enum Request {
     /// Stop serving once nothing is in flight, save the GPU's state, answer
-    /// with it, and wait for `Resume`.
+    /// with it, and wait for `Resume`. Only Linux takes snapshots.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Pause(Sender<Result<Vec<u8>, String>>),
     Resume,
 }
@@ -54,6 +55,7 @@ impl WorkerHandle {
 
     /// Stops the worker between commands, with every fenced command
     /// retired, and returns the GPU's state for a snapshot.
+    #[cfg(target_os = "linux")]
     pub fn pause(&self) -> Result<Vec<u8>, String> {
         let (reply, saved) = unbounded();
         self.ask(Request::Pause(reply));

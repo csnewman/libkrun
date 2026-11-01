@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::io::{self, IoSliceMut};
+#[cfg(target_os = "linux")]
+use std::io;
+use std::io::IoSliceMut;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;

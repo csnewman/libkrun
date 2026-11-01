@@ -25,6 +25,10 @@
 //! renderer records and rebuilds a Venus context itself, and this keeps its
 //! snapshot alongside the rest; see `Context::venus`.
 
+// Replaying is for restoring a snapshot, which only Linux takes: elsewhere
+// the record is kept but never replayed.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use bincode::{Decode, Encode};

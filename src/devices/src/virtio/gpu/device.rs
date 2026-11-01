@@ -8,9 +8,11 @@ use crossbeam_channel::bounded;
 use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+#[cfg(target_os = "linux")]
+use super::super::PauseError;
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, PauseError, Queue as VirtQueue,
-    QueueConfig, VirtioDevice, VirtioShmRegion, fs::ExportTable,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
+    VirtioDevice, VirtioShmRegion, fs::ExportTable,
 };
 use super::defs;
 use super::defs::uapi;
@@ -59,6 +61,7 @@ pub struct Gpu {
 }
 
 /// A copy of a queue's state, for the transport to save.
+#[cfg(target_os = "linux")]
 fn copy_queue(queue: &VirtQueue, event: &Arc<EventFd>) -> DeviceQueue {
     let mut copy = VirtQueue::new(queue.get_max_size());
     copy.restore(&queue.snapshot());
