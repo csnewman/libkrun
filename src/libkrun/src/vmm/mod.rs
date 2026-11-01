@@ -184,6 +184,10 @@ pub struct Vmm {
     pub(crate) paused: bool,
     #[cfg(target_os = "macos")]
     pub(crate) paused_at: u64,
+    // Guest memory a virtio-mem device plugs in, past RAM, whose pages are
+    // reclaimed as the guest unplugs them.
+    #[cfg(target_os = "macos")]
+    pub(crate) hotplug_region: Option<std::ops::Range<u64>>,
 }
 
 /// Out-of-band request to the running VM's event loop.
@@ -459,9 +463,15 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     pub fn reclaim_memory(&mut self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         let info = &self.arch_memory_info;
+        let end = guest_addr + len;
+        let in_ram = guest_addr >= info.ram_start_addr && end <= info.ram_last_addr;
+        let in_hotplug = self
+            .hotplug_region
+            .as_ref()
+            .is_some_and(|r| guest_addr >= r.start && end <= r.end);
         // Replacing the pages of the firmware or SHM regions, which are guest memory too, would
         // break them.
-        if guest_addr < info.ram_start_addr || guest_addr + len > info.ram_last_addr {
+        if !in_ram && !in_hotplug {
             warn!(
                 "Not reclaiming guest memory outside of RAM: guest_addr={guest_addr:x}, len={len}"
             );

@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
+#[cfg(target_os = "macos")]
+use utils::worker_message::WorkerMessage;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use super::defs::uapi::*;
@@ -40,6 +42,24 @@ impl InterruptHandler for Interrupts {
     }
 }
 
+/// Stands in for the VMM worker, which replaces reclaimed pages with fresh
+/// memory: here they are zeroed.
+#[cfg(target_os = "macos")]
+fn vmm_worker(mem: GuestMemoryMmap) -> crossbeam_channel::Sender<WorkerMessage> {
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    std::thread::spawn(move || {
+        for message in receiver {
+            if let WorkerMessage::ReclaimMemory(reply, addr, len) = message {
+                let zeroes = vec![0u8; len as usize];
+                reply
+                    .send(mem.write_slice(&zeroes, GuestAddress(addr)).is_ok())
+                    .unwrap();
+            }
+        }
+    });
+    sender
+}
+
 struct Harness {
     mem: GuestMemoryMmap,
     dev: Arc<Mutex<Mem>>,
@@ -57,6 +77,8 @@ impl Harness {
         let mut dev = Mem::new(REGION_SIZE).unwrap();
         let host_addr = mem.get_host_address(GuestAddress(REGION)).unwrap();
         dev.set_region(REGION, host_addr as usize);
+        #[cfg(target_os = "macos")]
+        dev.set_map_sender(vmm_worker(mem.clone()));
         Self {
             mem,
             dev: Arc::new(Mutex::new(dev)),

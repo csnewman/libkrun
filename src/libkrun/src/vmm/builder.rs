@@ -1379,6 +1379,10 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         vm_ctl_tx,
         #[cfg(target_os = "macos")]
+        hotplug_region: _shm_manager
+            .hotplug_region()
+            .map(|r| r.guest_addr.raw_value()..r.guest_addr.raw_value() + r.size as u64),
+        #[cfg(target_os = "macos")]
         vm_ctl_rx,
         #[cfg(target_os = "macos")]
         paused: false,
