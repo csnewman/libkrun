@@ -93,6 +93,38 @@ fn is_venus_memory_blob(session: &Session, r: &Resource) -> bool {
     }
 }
 
+/// The Venus contexts in the order they replay: each after the contexts
+/// whose Venus buffers it holds, which it imports as its commands replay.
+/// Contexts that hold each other's come in the order of their ids.
+fn venus_order(session: &Session) -> Vec<u32> {
+    let holds = |ctx_id: u32, c: &record::Context| -> BTreeSet<u32> {
+        c.attached
+            .iter()
+            .filter_map(|res| session.resources.get(res))
+            .filter(|r| is_venus_memory_blob(session, r))
+            .filter_map(|r| match &r.kind {
+                Kind::Blob(b) if b.ctx_id != ctx_id => Some(b.ctx_id),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut waiting: Vec<(u32, BTreeSet<u32>)> = session
+        .contexts
+        .iter()
+        .filter(|(_, c)| c.venus.is_some())
+        .map(|(&id, c)| (id, holds(id, c)))
+        .collect();
+    let mut order = Vec::with_capacity(waiting.len());
+    while !waiting.is_empty() {
+        let next = waiting
+            .iter()
+            .position(|(_, deps)| deps.iter().all(|d| !waiting.iter().any(|(w, _)| w == d)))
+            .unwrap_or(0);
+        order.push(waiting.remove(next).0);
+    }
+    order
+}
+
 fn guest_vecs(entries: &[(u64, u32)]) -> Vec<(GuestAddress, usize)> {
     entries
         .iter()
@@ -317,13 +349,23 @@ impl VirtioGpu {
 
         // Everything a Venus context names in shared memory, its rings and
         // reply streams, exists again by now with its contents, which is what
-        // a ring resumes from.
-        for (&ctx_id, c) in &session.contexts {
+        // a ring resumes from. A context's commands import the buffers it
+        // holds, a compositor's its clients', so the contexts replay one at a
+        // time, each after those whose buffers it holds, with what it holds
+        // that exists by then attached, and each context's own buffers are
+        // made as soon as it has replayed.
+        for ctx_id in venus_order(&session) {
+            let c = &session.contexts[&ctx_id];
             let Some((offset, len)) = c.venus else {
                 continue;
             };
             if lost.contexts.contains(&ctx_id) {
                 continue;
+            }
+            for &res in c.attached.iter().filter(|r| built.contains(r)) {
+                if let Err(e) = self.context_attach_resource(ctx_id, res) {
+                    warn!("gpu: context {ctx_id}: attaching resource {res}: {e:?}");
+                }
             }
             let restored = data
                 .get(offset as usize..(offset + len) as usize)
@@ -332,6 +374,25 @@ impl VirtioGpu {
             if let Err(e) = restored {
                 warn!("gpu: venus context {ctx_id}: {e}");
                 lost.contexts.insert(ctx_id);
+                continue;
+            }
+            for (&id, r) in &session.resources {
+                let Kind::Blob(b) = &r.kind else { continue };
+                if b.ctx_id != ctx_id || !is_venus_memory_blob(&session, r) {
+                    continue;
+                }
+                let create = ResourceCreateBlob {
+                    blob_mem: b.blob_mem,
+                    blob_flags: b.blob_flags,
+                    blob_id: b.blob_id,
+                    size: b.size,
+                };
+                match self.resource_create_blob(ctx_id, id, create, Vec::new(), mem) {
+                    Ok(_) => {
+                        built.insert(id);
+                    }
+                    Err(e) => warn!("gpu: venus blob {id}: {e:?}"),
+                }
             }
         }
 
@@ -353,24 +414,8 @@ impl VirtioGpu {
         }
 
         for (&id, r) in &session.resources {
-            if !is_venus_memory_blob(&session, r) {
+            if built.contains(&id) || !is_venus_memory_blob(&session, r) {
                 continue;
-            }
-            let Kind::Blob(b) = &r.kind else { continue };
-            if !lost.contexts.contains(&b.ctx_id) {
-                let create = ResourceCreateBlob {
-                    blob_mem: b.blob_mem,
-                    blob_flags: b.blob_flags,
-                    blob_id: b.blob_id,
-                    size: b.size,
-                };
-                match self.resource_create_blob(b.ctx_id, id, create, Vec::new(), mem) {
-                    Ok(_) => {
-                        built.insert(id);
-                        continue;
-                    }
-                    Err(e) => warn!("gpu: venus blob {id}: {e:?}"),
-                }
             }
             // A compositor's context samples its clients' buffers, and loses
             // all its state if one it binds is gone. A blank texture of the
