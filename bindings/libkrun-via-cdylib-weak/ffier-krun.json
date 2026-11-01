@@ -1625,7 +1625,7 @@
             " The VM must be configured as the one the snapshot was taken of: the",
             " same vCPUs, memory and payload, and the same devices in the same order.",
             " Its devices may use other file descriptors and sockets. Supported on",
-            " Linux."
+            " Linux and macOS."
           ],
           "receiver": "value",
           "params": [
@@ -1736,7 +1736,7 @@
             " Pause the VM and write a snapshot of it into the directory `dir`, which",
             " [`VmmBuilder::restore`] starts a VM from. The VM stays paused:",
             " [`VmmHandle::resume`] carries on from where it was. Must not be called",
-            " from the thread running [`Vmm::run`]. Supported on Linux."
+            " from the thread running [`Vmm::run`]. Supported on Linux and macOS."
           ],
           "receiver": "ref",
           "params": [

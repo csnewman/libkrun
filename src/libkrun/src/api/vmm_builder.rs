@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -150,9 +150,9 @@ impl<'a> VmmBuilder<'a> {
     /// The VM must be configured as the one the snapshot was taken of: the
     /// same vCPUs, memory and payload, and the same devices in the same order.
     /// Its devices may use other file descriptors and sockets. Supported on
-    /// Linux.
+    /// Linux and macOS.
     pub fn restore(mut self, dir: &str) -> Result<Self, VmmError> {
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return Err(VmmError::FeatureDisabled());
         }
         self.restore = Some(dir.to_string());
@@ -238,9 +238,9 @@ impl VmmHandle {
     /// Pause the VM and write a snapshot of it into the directory `dir`, which
     /// [`VmmBuilder::restore`] starts a VM from. The VM stays paused:
     /// [`VmmHandle::resume`] carries on from where it was. Must not be called
-    /// from the thread running [`Vmm::run`]. Supported on Linux.
+    /// from the thread running [`Vmm::run`]. Supported on Linux and macOS.
     pub fn snapshot(&self, dir: &str) -> Result<(), VmmError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let (done, result) = crossbeam_channel::bounded(1);
             self.vm_ctl_tx
@@ -251,7 +251,7 @@ impl VmmHandle {
                 .map_err(|e| VmmError::Internal(format!("snapshot: {e}")))?
                 .map_err(|e| VmmError::Internal(format!("snapshot: {e}")))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
         {
             let _ = dir;
             Err(VmmError::FeatureDisabled())
@@ -456,7 +456,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         vm_resources.restore_from = builder_cfg.restore.map(PathBuf::from);
     }
@@ -525,6 +525,12 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
             .map_err(|e| VmmError::Internal(format!("worker thread: {e}")))?;
     } else {
         let _ = receiver;
+    }
+
+    #[cfg(target_os = "macos")]
+    if vm_resources.restore_from.is_some() {
+        crate::vmm::builder::resume_restored(&inner)
+            .map_err(|e| VmmError::BootError(format!("restoring: {e}")))?;
     }
 
     Ok(Vmm {
