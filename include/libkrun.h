@@ -691,6 +691,15 @@ KrunGpuDevice krun_gpu_device_new(uint32_t virgl_flags, KrunDisplayBackend backe
 typedef KrunGpuDevice (*krun_gpu_device_new_fn)(uint32_t virgl_flags, KrunDisplayBackend backend);
 void krun_gpu_device_shm_size(KrunGpuDevice* handle, size_t size);
 typedef void (*krun_gpu_device_shm_size_fn)(KrunGpuDevice* handle, size_t size);
+/**
+ * Whether to offer the guest `VIRTIO_GPU_F_BLOB_ALIGNMENT`, asking it
+ * to size blobs in host pages, which is the default. A guest whose pages
+ * are as large as the host's doesn't need it, and Mesa's Venus driver
+ * before 26.2 doesn't size its blobs to it, so it can't create an
+ * instance when the feature is offered.
+ */
+void krun_gpu_device_blob_alignment(KrunGpuDevice* handle, bool enabled);
+typedef void (*krun_gpu_device_blob_alignment_fn)(KrunGpuDevice* handle, bool enabled);
 void krun_gpu_device_destroy(KrunGpuDevice handle);
 typedef void (*krun_gpu_device_destroy_fn)(KrunGpuDevice handle);
 
