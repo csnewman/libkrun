@@ -436,19 +436,25 @@ impl Virgl {
     fn observe_one(&mut self, cmd: u32, obj: u32, p: &[u32], full: &[u32]) {
         use ccmd::*;
         match cmd {
+            // As the renderer has them: creating a sub-context that exists
+            // and switching to one that doesn't do nothing, and destroying
+            // the current one switches to sub-context 0. Mesa switches to a
+            // destroyed sub-context's id at the start of every command
+            // buffer after it.
             CREATE_SUB_CTX if !p.is_empty() => {
-                self.subs.insert(p[0], Sub::default());
+                self.subs.entry(p[0]).or_default();
                 return;
             }
             DESTROY_SUB_CTX if !p.is_empty() => {
-                if p[0] != 0 {
-                    self.subs.remove(&p[0]);
+                if p[0] != 0 && self.subs.remove(&p[0]).is_some() && self.current == p[0] {
+                    self.current = 0;
                 }
                 return;
             }
             SET_SUB_CTX if !p.is_empty() => {
-                self.current = p[0];
-                self.subs.entry(p[0]).or_default();
+                if self.subs.contains_key(&p[0]) {
+                    self.current = p[0];
+                }
                 return;
             }
             PIPE_RESOURCE_CREATE if p.len() >= 11 => {
@@ -943,5 +949,28 @@ mod tests {
         assert_eq!((c.width, c.height, c.depth, c.array_size), (640, 480, 1, 1));
         assert_eq!(c.bind, BIND_SAMPLER_VIEW);
         assert!(v.stand_in(48).is_none());
+    }
+
+    #[test]
+    fn a_destroyed_sub_context_stays_gone() {
+        let mut v = Virgl::new();
+        let words = [
+            header(ccmd::CREATE_SUB_CTX, 0, 1),
+            7,
+            header(ccmd::SET_SUB_CTX, 0, 1),
+            7,
+            header(ccmd::DESTROY_SUB_CTX, 0, 1),
+            7,
+            // Mesa starts its next command buffer on the destroyed id.
+            header(ccmd::SET_SUB_CTX, 0, 1),
+            7,
+            header(ccmd::CREATE_SUB_CTX, 0, 1),
+            0,
+        ];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        v.observe(&bytes);
+
+        assert_eq!(v.subs.keys().copied().collect::<Vec<_>>(), [0]);
+        assert_eq!(v.current, 0);
     }
 }
