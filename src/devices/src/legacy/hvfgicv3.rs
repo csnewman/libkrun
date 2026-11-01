@@ -180,9 +180,10 @@ impl HvfGicV3 {
     }
 
     fn state_bindings(&self) -> Result<&HvfGicStateBindings, DeviceError> {
-        self.bindings.state.as_ref().ok_or_else(|| {
-            DeviceError::Snapshot("this macOS can't save the GIC's state".into())
-        })
+        self.bindings
+            .state
+            .as_ref()
+            .ok_or_else(|| DeviceError::Snapshot("this macOS can't save the GIC's state".into()))
     }
 }
 

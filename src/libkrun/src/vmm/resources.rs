@@ -11,7 +11,7 @@ use std::io::BufReader;
 use std::os::fd::RawFd;
 #[cfg(target_os = "windows")]
 use std::os::windows::raw::HANDLE;
-#[cfg(any(feature = "tee", target_os = "linux"))]
+#[cfg(any(feature = "tee", target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 
 #[cfg(feature = "tee")]
@@ -122,7 +122,7 @@ pub struct VmResources {
     /// discovered via the kernel command line and SMP uses the MP table.
     pub acpi_enabled: bool,
     /// A snapshot to restore the VM from, rather than boot it.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub restore_from: Option<PathBuf>,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
@@ -275,7 +275,7 @@ mod tests {
             reset_exit_code: None,
             split_irqchip: false,
             acpi_enabled: false,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             restore_from: None,
             serial_consoles: Vec::new(),
             kernel_console: None,
