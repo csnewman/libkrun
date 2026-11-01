@@ -43,7 +43,7 @@ use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObs
 use krun_input;
 use polly::event_manager::{EventManager, Subscriber};
 use vm_memory::GuestMemoryMmap;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(feature = "tee"))]
 use vm_memory::{Address, GuestMemoryBackend};
 
 use super::error::VmmError;
@@ -60,6 +60,9 @@ pub struct DeviceRequirements {
     /// GPU shared memory size, if this is a GPU device.
     #[cfg(feature = "gpu")]
     pub gpu_shm: Option<usize>,
+    /// Size of the region of hotpluggable memory needed, if this is a
+    /// virtio-mem device.
+    pub hotplug_mem: Option<usize>,
     /// Whether this device needs process-shareable memory (vhost-user).
     pub process_shareable_memory: bool,
     /// Supplies the guest RTC, suppressing any legacy or implicit RTC.
@@ -212,6 +215,24 @@ impl<'a> AttachContext<'a> {
                 .guest_memory
                 .get_host_address(r.guest_addr)
                 .expect("gpu shm region host address");
+            ResolvedShmRegion {
+                host_addr: host_addr as u64,
+                guest_addr: r.guest_addr.raw_value(),
+                size: r.size,
+            }
+        })
+    }
+
+    /// The resolved region of hotpluggable memory, if a region was allocated
+    /// based on [`DeviceRequirements::hotplug_mem`].
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    pub fn resolved_hotplug_region(&self) -> Option<ResolvedShmRegion> {
+        self.shm_manager.hotplug_region().map(|r| {
+            let host_addr = self
+                .vmm
+                .guest_memory
+                .get_host_address(r.guest_addr)
+                .expect("hotplug region host address");
             ResolvedShmRegion {
                 host_addr: host_addr as u64,
                 guest_addr: r.guest_addr.raw_value(),
