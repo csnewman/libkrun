@@ -2117,6 +2117,7 @@ pub struct GpuDevice {
     virgl_flags: u32,
     backend: DisplayBackend,
     shm_size: usize,
+    blob_alignment: bool,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
@@ -2129,11 +2130,22 @@ impl GpuDevice {
             virgl_flags: virgl_flags.bits(),
             backend,
             shm_size: Self::DEFAULT_SHM_SIZE,
+            blob_alignment: true,
         }
     }
 
     pub fn shm_size(mut self, size: usize) -> Self {
         self.shm_size = size;
+        self
+    }
+
+    /// Whether to offer the guest `VIRTIO_GPU_F_BLOB_ALIGNMENT`, asking it
+    /// to size blobs in host pages, which is the default. A guest whose pages
+    /// are as large as the host's doesn't need it, and Mesa's Venus driver
+    /// before 26.2 doesn't size its blobs to it, so it can't create an
+    /// instance when the feature is offered.
+    pub fn blob_alignment(mut self, enabled: bool) -> Self {
+        self.blob_alignment = enabled;
         self
     }
 }
@@ -2153,7 +2165,7 @@ impl<'a> AttachDevice<'a> for GpuDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         let displays: Box<[DisplayInfo]> = self.backend.displays.into_boxed_slice();
 
-        let gpu = devices::virtio::Gpu::new(
+        let mut gpu = devices::virtio::Gpu::new(
             self.virgl_flags,
             displays,
             self.backend.inner,
@@ -2161,6 +2173,9 @@ impl<'a> AttachDevice<'a> for GpuDevice {
             ctx.map_sender().expect("macOS requires map_sender for GPU"),
         )
         .map_err(|e| VmmError::Internal(format!("gpu: {e:?}")))?;
+        if !self.blob_alignment {
+            gpu.withhold_blob_alignment();
+        }
 
         let inner = Arc::new(Mutex::new(gpu));
 
