@@ -35,7 +35,6 @@ use krun_display::Rect;
 enum Request {
     /// Stop serving once nothing is in flight, save the GPU's state, answer
     /// with it, and wait for `Resume`. Only Linux takes snapshots.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Pause(Sender<Result<Vec<u8>, String>>),
     Resume,
 }
@@ -55,7 +54,7 @@ impl WorkerHandle {
 
     /// Stops the worker between commands, with every fenced command
     /// retired, and returns the GPU's state for a snapshot.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn pause(&self) -> Result<Vec<u8>, String> {
         let (reply, saved) = unbounded();
         self.ask(Request::Pause(reply));
@@ -228,18 +227,18 @@ impl Worker {
             }
             thread::sleep(Duration::from_millis(1));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         return virtio_gpu.save_session();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
         Err("gpu snapshots are not supported on this platform".into())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn restore(&self, virtio_gpu: &mut VirtioGpu, state: &[u8]) -> Result<(), String> {
         virtio_gpu.restore_session(state, &self.mem, &self.shm_region)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
     fn restore(&self, _virtio_gpu: &mut VirtioGpu, _state: &[u8]) -> Result<(), String> {
         Err("gpu snapshots are not supported on this platform".into())
     }

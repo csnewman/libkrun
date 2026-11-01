@@ -1,7 +1,7 @@
 mod device;
 mod protocol;
 mod record;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod snapshot;
 mod virtio_gpu;
 mod worker;

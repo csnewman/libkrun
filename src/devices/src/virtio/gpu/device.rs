@@ -8,7 +8,7 @@ use crossbeam_channel::bounded;
 use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::super::PauseError;
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
@@ -61,7 +61,7 @@ pub struct Gpu {
 }
 
 /// A copy of a queue's state, for the transport to save.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn copy_queue(queue: &VirtQueue, event: &Arc<EventFd>) -> DeviceQueue {
     let mut copy = VirtQueue::new(queue.get_max_size());
     copy.restore(&queue.snapshot());
@@ -292,7 +292,7 @@ impl VirtioDevice for Gpu {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
         let (Some(worker), Some((control, event)), Some(cursor)) =
             (&self.worker, &self.control_queue, &self.cursor_queue)

@@ -19,8 +19,8 @@ use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, Sender, after, select, unbounded};
-use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use devices::legacy::{IrqChip, VcpuList};
+use hvf::{HvfVcpu, HvfVcpuState, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -253,6 +253,54 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+
+    // Saves and restores the vCPU's CPU interface, which HVF does only on
+    // the vCPU's own thread.
+    intc: Option<IrqChip>,
+    // Whether the vCPU waits for a VcpuEvent::Restore in place of its boot.
+    restoring: bool,
+    // The host's counter when the vCPU last paused.
+    paused_at: u64,
+}
+
+/// Version of a snapshot's vCPU sections.
+pub const VCPU_SNAPSHOT_VERSION: u8 = 1;
+
+#[derive(bincode::Encode, bincode::Decode)]
+struct HvfVcpuSnapshot {
+    gp: Vec<u64>,
+    sysregs: Vec<(u16, u64)>,
+    simd: Vec<u128>,
+    fpcr: u64,
+    fpsr: u64,
+    vtimer_masked: bool,
+    counter: u64,
+    icc: Vec<(u32, u64)>,
+}
+
+impl HvfVcpuSnapshot {
+    fn decode(bytes: &[u8]) -> std::result::Result<Self, String> {
+        bincode::decode_from_slice(bytes, bincode::config::standard())
+            .map(|(state, _)| state)
+            .map_err(|e| format!("vcpu state: {e}"))
+    }
+}
+
+/// The guest's virtual counter in a vCPU's snapshot.
+pub fn snapshot_counter(bytes: &[u8]) -> std::result::Result<u64, String> {
+    HvfVcpuSnapshot::decode(bytes).map(|state| state.counter)
+}
+
+/// What a vCPU loads in place of its boot.
+#[derive(Debug)]
+pub struct VcpuRestore {
+    /// The vCPU's section of the snapshot.
+    pub state: Vec<u8>,
+    /// The interrupt controller's state, given to the first vCPU restored:
+    /// HVF loads it once every vCPU exists, and before their CPU interfaces.
+    pub irqchip: Option<Vec<u8>>,
+    /// Puts the guest's counter where it was; the same for every vCPU.
+    pub vtimer_offset: u64,
 }
 
 impl Vcpu {
@@ -348,7 +396,22 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            intc: None,
+            restoring: false,
+            paused_at: 0,
         })
+    }
+
+    /// Sets the interrupt controller, whose state for this vCPU a snapshot
+    /// saves and restores on the vCPU's thread.
+    pub fn set_intc(&mut self, intc: IrqChip) {
+        self.intc = Some(intc);
+    }
+
+    /// Has the vCPU wait for a [`VcpuEvent::Restore`] in place of its boot,
+    /// and stay paused once it's restored.
+    pub fn set_restoring(&mut self) {
+        self.restoring = true;
     }
 
     /// Returns the cpu index as seen by the guest OS.
@@ -505,22 +568,39 @@ impl Vcpu {
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
+        if self.restoring {
+            match self.event_receiver.recv() {
+                Ok(VcpuEvent::Restore(restore)) => {
+                    let result = self.restore(&mut hvf_vcpu, *restore);
+                    let ok = result.is_ok();
+                    self.response_sender
+                        .send(VcpuResponse::Restored(result))
+                        .expect("failed to send Restored status");
+                    if !ok {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+            self.park(&mut hvf_vcpu);
         } else {
-            self.boot_entry_addr
-        };
+            let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
+                boot_receiver.recv().unwrap()
+            } else {
+                self.boot_entry_addr
+            };
 
-        hvf_vcpu
-            .set_initial_state(self.ipa_size, entry_addr, self.fdt_addr)
-            .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+            hvf_vcpu
+                .set_initial_state(self.ipa_size, entry_addr, self.fdt_addr)
+                .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+        }
 
         loop {
             // An out-of-band pause request breaks the vCPU out of HVF via
             // `vcpu_request_exit` (-> Canceled), so we observe it here between
             // guest runs and freeze on this thread, where the HvfVcpu lives.
             if let Ok(VcpuEvent::Pause) = self.event_receiver.try_recv() {
-                self.pause_and_park(&hvf_vcpu);
+                self.pause_and_park(&mut hvf_vcpu);
             }
             match self.run_emulation(&mut hvf_vcpu) {
                 // Emulation ran successfully, continue.
@@ -529,11 +609,11 @@ impl Vcpu {
                 Ok(VcpuEmulation::Interrupted) => self.wait_for_resume(),
                 // Wait for an external event.
                 Ok(VcpuEmulation::WaitForEvent) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu)
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &mut hvf_vcpu)
                 }
                 Ok(VcpuEmulation::WaitForEventExpired) => (),
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &mut hvf_vcpu)
                 }
                 // The guest was rebooted or halted.
                 Ok(VcpuEmulation::Stopped) => {
@@ -559,7 +639,7 @@ impl Vcpu {
         hvf_vcpuid: u64,
         receiver: &Receiver<u32>,
         timeout: Option<Duration>,
-        hvf_vcpu: &HvfVcpu,
+        hvf_vcpu: &mut HvfVcpu,
     ) {
         if !self.vcpu_list.should_wait(hvf_vcpuid) {
             return;
@@ -588,10 +668,16 @@ impl Vcpu {
     /// keeps the guest's CNTVCT continuous so armed timers don't fire en masse
     /// to catch up the gap. The coordinator computes the tick count once for the
     /// whole VM, so multi-vCPU offsets stay in lockstep.
-    fn pause_and_park(&mut self, hvf_vcpu: &HvfVcpu) {
+    fn pause_and_park(&mut self, hvf_vcpu: &mut HvfVcpu) {
+        self.paused_at = unsafe { hvf::mach_absolute_time() };
         self.response_sender
             .send(VcpuResponse::Paused)
             .expect("failed to send Paused status");
+        self.park(hvf_vcpu);
+    }
+
+    /// Blocks until `Resume`, saving the vCPU for each `Snapshot` meanwhile.
+    fn park(&mut self, hvf_vcpu: &mut HvfVcpu) {
         loop {
             match self.event_receiver.recv() {
                 Ok(VcpuEvent::Resume(paused_ticks)) => {
@@ -605,10 +691,77 @@ impl Vcpu {
                         .expect("failed to send Resumed status");
                     return;
                 }
+                Ok(VcpuEvent::Snapshot) => {
+                    let state = self.save(hvf_vcpu);
+                    self.response_sender
+                        .send(VcpuResponse::Snapshotted(state))
+                        .expect("failed to send Snapshotted status");
+                }
                 Ok(_) => {}
                 Err(_) => return,
             }
         }
+    }
+
+    /// The vCPU's section of a snapshot: its registers and its CPU interface.
+    fn save(&self, hvf_vcpu: &mut HvfVcpu) -> std::result::Result<Vec<u8>, String> {
+        let state = hvf_vcpu
+            .save_state(self.paused_at)
+            .map_err(|e| format!("registers: {e}"))?;
+        let icc = self
+            .intc
+            .as_ref()
+            .ok_or("no interrupt controller")?
+            .lock()
+            .unwrap()
+            .save_vcpu_state(hvf_vcpu.id())
+            .map_err(|e| format!("CPU interface: {e}"))?;
+        let snapshot = HvfVcpuSnapshot {
+            gp: state.gp,
+            sysregs: state.sysregs,
+            simd: state.simd,
+            fpcr: state.fpcr,
+            fpsr: state.fpsr,
+            vtimer_masked: state.vtimer_masked,
+            counter: state.counter,
+            icc,
+        };
+        bincode::encode_to_vec(snapshot, bincode::config::standard()).map_err(|e| e.to_string())
+    }
+
+    /// Loads a snapshot into this vCPU, which hasn't run: the interrupt
+    /// controller's state if it's given, then the registers, then the CPU
+    /// interface, which lives in the controller's state.
+    fn restore(
+        &mut self,
+        hvf_vcpu: &mut HvfVcpu,
+        restore: VcpuRestore,
+    ) -> std::result::Result<(), String> {
+        let snapshot = HvfVcpuSnapshot::decode(&restore.state)?;
+        let intc = self.intc.as_ref().ok_or("no interrupt controller")?;
+        if let Some(irqchip) = &restore.irqchip {
+            intc.lock()
+                .unwrap()
+                .restore_state(&[], irqchip)
+                .map_err(|e| format!("interrupt controller: {e}"))?;
+        }
+        let state = HvfVcpuState {
+            gp: snapshot.gp,
+            sysregs: snapshot.sysregs,
+            simd: snapshot.simd,
+            fpcr: snapshot.fpcr,
+            fpsr: snapshot.fpsr,
+            vtimer_masked: snapshot.vtimer_masked,
+            counter: snapshot.counter,
+        };
+        hvf_vcpu
+            .restore_state(&state, restore.vtimer_offset)
+            .map_err(|e| format!("registers: {e}"))?;
+        self.paused_at = unsafe { hvf::mach_absolute_time() };
+        intc.lock()
+            .unwrap()
+            .restore_vcpu_state(hvf_vcpu.id(), &snapshot.icc)
+            .map_err(|e| format!("CPU interface: {e}"))
     }
 
     fn exit(&mut self, exit_code: u8) {
@@ -637,6 +790,10 @@ pub enum VcpuEvent {
     /// (the wall-clock time the VM spent paused). The coordinator sends the
     /// same value to every vCPU so their counters stay synchronized.
     Resume(u64),
+    /// Save the paused Vcpu for a snapshot.
+    Snapshot,
+    /// Load a snapshot into the Vcpu, in place of its boot.
+    Restore(Box<VcpuRestore>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -648,6 +805,10 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// The Vcpu's section of a snapshot.
+    Snapshotted(std::result::Result<Vec<u8>, String>),
+    /// The Vcpu loaded its snapshot, and is paused.
+    Restored(std::result::Result<(), String>),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
