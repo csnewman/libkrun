@@ -16,8 +16,9 @@ use utils::eventfd::EventFd;
 use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
 use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
 
-use super::device::{InterruptHandler, InterruptType, VirtioTransportState};
+use super::device::{InterruptHandler, InterruptType, SavedTransport, VirtioTransportState};
 use super::{InterruptTransport, VirtioDevice, device_status};
+use crate::snapshot::{SavedState, Snapshottable};
 
 const PCI_VENDOR_ID_VIRTIO: u16 = 0x1af4;
 const PCI_DEVICE_ID_VIRTIO_MODERN: u16 = 0x1040;
@@ -357,6 +358,30 @@ impl PciInterrupt {
             && let Err(err) = self.0.line.set_level(!disabled)
         {
             warn!("failed to update virtio-pci INTx disable state: {err}");
+        }
+    }
+
+    fn saved(&self) -> (u8, bool) {
+        let state = self.0.state.lock().unwrap();
+        (state.isr, state.intx_disabled)
+    }
+
+    /// Loads saved interrupt state, asserting INTx if it was asserted.
+    fn restore(&self, isr: u8, intx_disabled: bool) {
+        let mut state = self.0.state.lock().unwrap();
+        state.isr = isr;
+        state.intx_disabled = intx_disabled;
+        let msix_enabled = self
+            .0
+            .msix
+            .as_ref()
+            .is_some_and(|msix| msix.lock().unwrap().enabled);
+        if isr != 0
+            && !intx_disabled
+            && !msix_enabled
+            && let Err(err) = self.0.line.set_level(true)
+        {
+            warn!("failed to assert virtio-pci INTx on restore: {err}");
         }
     }
 
@@ -1556,6 +1581,146 @@ impl PciFunction for VirtioPciTransport {
             return PciBarAccess::Unhandled;
         }
         self.write_bar_region(offset, data)
+    }
+}
+
+const PCI_SNAPSHOT_VERSION: u8 = 1;
+
+#[derive(bincode::Encode, bincode::Decode)]
+struct SavedPci {
+    transport: SavedTransport,
+    config: Vec<u8>,
+    bar_base: u32,
+    bar_probe: bool,
+    /// Each queue's `(size, enabled, notification_pending)`.
+    queues: Vec<(u16, bool, bool)>,
+    isr: u8,
+    intx_disabled: bool,
+    msix: Option<SavedMsix>,
+}
+
+#[derive(bincode::Encode, bincode::Decode)]
+struct SavedMsix {
+    enabled: bool,
+    function_masked: bool,
+    /// Each vector's `(address, data, masked)`.
+    table: Vec<(u64, u32, bool)>,
+    pending: Vec<bool>,
+    config_vector: u16,
+    queue_vectors: Vec<u16>,
+}
+
+impl Snapshottable for VirtioPciTransport {
+    fn pause(&mut self) -> Result<(), crate::Error> {
+        self.state.pause()
+    }
+
+    fn save(&self) -> Result<SavedState, crate::Error> {
+        let (isr, intx_disabled) = self.interrupt.saved();
+        let msix = self.msix.as_ref().map(|msix| {
+            let msix = msix.lock().unwrap();
+            SavedMsix {
+                enabled: msix.enabled,
+                function_masked: msix.function_masked,
+                table: msix
+                    .table
+                    .iter()
+                    .map(|e| (e.address, e.data, e.masked))
+                    .collect(),
+                pending: msix.pending.clone(),
+                config_vector: msix.config_vector,
+                queue_vectors: msix.queue_vectors.clone(),
+            }
+        });
+        let saved = SavedPci {
+            transport: self.state.save()?,
+            config: self.config.0.to_vec(),
+            bar_base: self.bar_base,
+            bar_probe: self.bar_probe,
+            queues: self
+                .queue_registers
+                .iter()
+                .map(|q| (q.size, q.enabled, q.notification_pending))
+                .collect(),
+            isr,
+            intx_disabled,
+            msix,
+        };
+        let bytes = bincode::encode_to_vec(&saved, bincode::config::standard())
+            .map_err(|e| crate::Error::Snapshot(e.to_string()))?;
+        Ok(SavedState {
+            version: PCI_SNAPSHOT_VERSION,
+            bytes,
+        })
+    }
+
+    fn restore(&mut self, state: &SavedState) -> Result<(), crate::Error> {
+        let err = |e: &str| crate::Error::Snapshot(format!("virtio-pci: {e}"));
+        if state.version != PCI_SNAPSHOT_VERSION {
+            return Err(err(&format!("unsupported state version {}", state.version)));
+        }
+        let (saved, _): (SavedPci, _) =
+            bincode::decode_from_slice(&state.bytes, bincode::config::standard())
+                .map_err(|e| err(&e.to_string()))?;
+        if saved.config.len() != PCI_CONFIG_SIZE {
+            return Err(err("configuration space size"));
+        }
+        if saved.queues.len() != self.queue_registers.len() {
+            return Err(err("queue count"));
+        }
+        if saved.msix.is_some() != self.msix.is_some() {
+            return Err(err("MSI-X offered in one and not the other"));
+        }
+
+        self.state.restore(&saved.transport)?;
+        self.config.0.copy_from_slice(&saved.config);
+        self.bar_base = saved.bar_base;
+        self.bar_probe = saved.bar_probe;
+        for (registers, &(size, enabled, notification_pending)) in
+            self.queue_registers.iter_mut().zip(&saved.queues)
+        {
+            registers.size = size;
+            registers.enabled = enabled;
+            registers.notification_pending = notification_pending;
+        }
+        let command = self
+            .config
+            .read_u16(pci_config::COMMAND)
+            .expect("PCI command register fits in configuration space");
+        self.bus_master_enabled
+            .store(command & PCI_COMMAND_MASTER != 0, Ordering::Release);
+
+        if let (Some(msix), Some(saved_msix)) = (&self.msix, &saved.msix) {
+            let mut msix = msix.lock().unwrap();
+            if saved_msix.table.len() != msix.table.len()
+                || saved_msix.queue_vectors.len() != msix.queue_vectors.len()
+            {
+                return Err(err("MSI-X vector count"));
+            }
+            msix.enabled = saved_msix.enabled;
+            msix.function_masked = saved_msix.function_masked;
+            for (entry, &(address, data, masked)) in msix.table.iter_mut().zip(&saved_msix.table) {
+                *entry = MsixEntry {
+                    address,
+                    data,
+                    masked,
+                };
+            }
+            msix.pending.copy_from_slice(&saved_msix.pending);
+            msix.config_vector = saved_msix.config_vector;
+            msix.queue_vectors
+                .copy_from_slice(&saved_msix.queue_vectors);
+            // Routes the vectors the guest had unmasked, and delivers the
+            // ones left pending.
+            msix.sync_all();
+        }
+        self.interrupt.restore(saved.isr, saved.intx_disabled);
+        self.update_queue_notifications();
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), crate::Error> {
+        self.state.resume(self.device_interrupt.clone())
     }
 }
 
