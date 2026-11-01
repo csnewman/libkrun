@@ -25,8 +25,13 @@ use libc::c_void;
 use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD;
-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_SHM;
+/// The shared memory handle type, magma_gpu's MAGMA_GPU_HANDLE_TYPE_MEM_SHM,
+/// which rutabaga_gfx doesn't re-export.
+#[cfg(any(
+    all(target_os = "linux", feature = "virgl_resource_map2"),
+    target_os = "macos"
+))]
+const RUTABAGA_HANDLE_TYPE_MEM_SHM: u32 = 0x0004;
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
     RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW,
@@ -1091,7 +1096,11 @@ impl VirtioGpu {
         if let Ok(export) = self.rutabaga.export_blob(resource_id)
             && let Some(mesa_handle) = export.as_mesa_handle()
         {
-            if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
+            // The mapping only takes the blob's host pointer. virglrenderer's
+            // Venus exports host-visible memory as shared memory on macOS.
+            if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF
+                || mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_SHM
+            {
                 let guest_addr = checked_blob_map_addr(
                     shm_region.guest_addr,
                     offset,
