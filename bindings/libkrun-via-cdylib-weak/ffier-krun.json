@@ -226,6 +226,22 @@
         }
       }
     },
+    "MemDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunMemDevice"
+        }
+      },
+      "type_tag": 16777244
+    },
+    "MemDeviceHandle": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunMemDeviceHandle"
+        }
+      },
+      "type_tag": 16777245
+    },
     "MmioDeviceManager": {
       "kind": {
         "handle": {
@@ -1871,6 +1887,111 @@
       "cfg": "target_os = \"linux\""
     },
     {
+      "name": "MemDevice",
+      "destroy_ffi_name": "krun_mem_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "doc": [
+            " A device that can give the guest up to `region_mib` MiB of memory on",
+            " top of its RAM, rounded up to a multiple of 128 MiB. The guest starts",
+            " with none of it."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "region_mib",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "MemDevice"
+            },
+            "err_type": "VmmError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_mem_device_new"
+        },
+        {
+          "name": "handle",
+          "doc": [
+            " A handle for resizing the guest's memory while the VM runs. Take it",
+            " before adding the device, which consumes it."
+          ],
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "MemDeviceHandle"
+          },
+          "ffi_name": "krun_mem_device_handle"
+        }
+      ],
+      "cfg": "all(target_os = \"linux\", not(feature = \"tee\"))"
+    },
+    {
+      "name": "MemDeviceHandle",
+      "destroy_ffi_name": "krun_mem_device_handle_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "set_requested_mib",
+          "doc": [
+            " Asks the guest to plug in or unplug memory until it has `mib` MiB of",
+            " the region. `mib` must be a multiple of 2 MiB and no more than the",
+            " region. The guest does this in its own time, and may not manage to",
+            " unplug all that's asked of it."
+          ],
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "mib",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_mem_device_handle_set_requested_mib"
+        },
+        {
+          "name": "requested_mib",
+          "doc": [
+            " How much of the region the guest has been asked to have, in MiB."
+          ],
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "u32"
+          },
+          "ffi_name": "krun_mem_device_handle_requested_mib"
+        },
+        {
+          "name": "plugged_mib",
+          "doc": [
+            " How much of the region the guest has plugged in, in MiB."
+          ],
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "u32"
+          },
+          "ffi_name": "krun_mem_device_handle_plugged_mib"
+        }
+      ],
+      "cfg": "all(target_os = \"linux\", not(feature = \"tee\"))"
+    },
+    {
       "name": "VsockDevice",
       "destroy_ffi_name": "krun_vsock_device_destroy",
       "is_builder_type": false,
@@ -3295,6 +3416,18 @@
       ],
       "methods": [],
       "cfg": "target_os = \"linux\""
+    },
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "MemDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "methods": [],
+      "cfg": "all(target_os = \"linux\", not(feature = \"tee\"))"
     },
     {
       "trait_name": "AttachDevice",
