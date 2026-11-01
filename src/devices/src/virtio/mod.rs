@@ -27,6 +27,8 @@ pub mod gpu;
 #[cfg(feature = "input")]
 pub mod input;
 pub mod linux_errno;
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+pub mod mem;
 mod mmio;
 #[cfg(feature = "net")]
 pub mod net;
@@ -50,6 +52,8 @@ pub use self::device::*;
 pub use self::fs::*;
 #[cfg(feature = "gpu")]
 pub use self::gpu::*;
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+pub use self::mem::{Mem, MemError};
 pub use self::mmio::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;

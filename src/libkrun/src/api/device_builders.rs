@@ -38,6 +38,8 @@ use devices::virtio::block::{DiskFormat, SyncMode};
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use devices::virtio::fs::{CachePolicy, PermissionSemantics};
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+use devices::virtio::mem;
 use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
 #[cfg(feature = "input")]
 use krun_input;
@@ -1433,6 +1435,117 @@ impl<'a> AttachDevice<'a> for RtcDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("rtc", self.inner)
+    }
+}
+
+/// A virtio-mem device: memory the guest plugs in and unplugs while it runs,
+/// from a region past the end of its RAM. The guest has none of the region
+/// until [`MemDeviceHandle::set_requested_mib`] asks it to plug some in.
+///
+/// The guest kernel must have a virtio-mem driver.
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+pub struct MemDevice {
+    inner: Arc<Mutex<devices::virtio::Mem>>,
+}
+
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(cfg = "all(target_os = \"linux\", not(feature = \"tee\"))")
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(all(target_os = "linux", not(feature = "tee")))
+)]
+impl MemDevice {
+    /// A device that can give the guest up to `region_mib` MiB of memory on
+    /// top of its RAM, rounded up to a multiple of 128 MiB. The guest starts
+    /// with none of it.
+    pub fn new(region_mib: u32) -> Result<Self, VmmError> {
+        let size = (u64::from(region_mib) << 20).next_multiple_of(mem::REGION_ALIGN);
+        let mem = devices::virtio::Mem::new(size)
+            .map_err(|e| VmmError::Internal(format!("mem: {e:?}")))?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(mem)),
+        })
+    }
+
+    /// A handle for resizing the guest's memory while the VM runs. Take it
+    /// before adding the device, which consumes it.
+    pub fn handle(&self) -> MemDeviceHandle {
+        MemDeviceHandle {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(cfg = "all(target_os = \"linux\", not(feature = \"tee\"))")
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(all(target_os = "linux", not(feature = "tee")))
+)]
+impl<'a> AttachDevice<'a> for MemDevice {
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            hotplug_mem: Some(self.inner.lock().unwrap().region_size() as usize),
+            ..Default::default()
+        }
+    }
+
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        let region = ctx
+            .resolved_hotplug_region()
+            .ok_or_else(|| VmmError::Internal("mem: no hotplug region".into()))?;
+        self.inner
+            .lock()
+            .unwrap()
+            .set_region(region.guest_addr, region.host_addr as usize);
+        ctx.subscribe_events(self.inner.clone())?;
+        ctx.register("mem", self.inner)
+    }
+}
+
+/// Changes how much of a [`MemDevice`]'s region the guest has, from any
+/// thread, while the VM runs.
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+#[derive(Clone)]
+pub struct MemDeviceHandle {
+    inner: Arc<Mutex<devices::virtio::Mem>>,
+}
+
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(cfg = "all(target_os = \"linux\", not(feature = \"tee\"))")
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(all(target_os = "linux", not(feature = "tee")))
+)]
+impl MemDeviceHandle {
+    /// Asks the guest to plug in or unplug memory until it has `mib` MiB of
+    /// the region. `mib` must be a multiple of 2 MiB and no more than the
+    /// region. The guest does this in its own time, and may not manage to
+    /// unplug all that's asked of it.
+    pub fn set_requested_mib(&self, mib: u32) -> Result<(), VmmError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_requested_size(u64::from(mib) << 20)
+            .map_err(|e| VmmError::Internal(format!("mem: {e:?}")))
+    }
+
+    /// How much of the region the guest has been asked to have, in MiB.
+    pub fn requested_mib(&self) -> u32 {
+        (self.inner.lock().unwrap().requested_size() >> 20) as u32
+    }
+
+    /// How much of the region the guest has plugged in, in MiB.
+    pub fn plugged_mib(&self) -> u32 {
+        (self.inner.lock().unwrap().plugged_size() >> 20) as u32
     }
 }
 
