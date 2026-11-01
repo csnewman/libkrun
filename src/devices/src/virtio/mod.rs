@@ -54,7 +54,7 @@ pub use self::mmio::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
 pub use self::pci::*;
-pub use self::queue::{Descriptor, DescriptorChain, Queue};
+pub use self::queue::{Descriptor, DescriptorChain, Queue, QueueSnapshot};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;
 #[cfg(target_os = "linux")]

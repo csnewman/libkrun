@@ -8,7 +8,7 @@
 #[cfg(target_arch = "aarch64")]
 use arch::ArchMemoryInfo;
 #[cfg(target_arch = "aarch64")]
-use arch::aarch64::regs::{read_counter, write_counter};
+use arch::aarch64::regs::{TIMER_CNT, read_counter, write_counter};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use libc::{c_int, c_void, siginfo_t};
 use std::cell::Cell;
@@ -30,6 +30,8 @@ use std::sync::atomic::{Ordering, fence};
 use std::thread;
 #[cfg(target_arch = "x86_64")]
 use std::time::Duration;
+#[cfg(target_arch = "x86_64")]
+use std::{ptr, slice};
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 
@@ -66,6 +68,8 @@ use kvm_bindings::{
     KVM_MEM_GUEST_MEMFD, KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_create_guest_memfd,
     kvm_memory_attributes, kvm_userspace_memory_region2,
 };
+#[cfg(target_arch = "aarch64")]
+use kvm_bindings::{RegList, kvm_mp_state};
 use kvm_ioctls::{Cap::*, *};
 use utils::eventfd::EventFd;
 use utils::signal::{Killable, register_signal_handler, sigrtmin};
@@ -854,6 +858,42 @@ impl Vm {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn fd_shared(&self) -> Arc<VmFd> {
         self.fd.clone()
+    }
+
+    /// The VM's PIT, PICs, IOAPIC and kvmclock, for a snapshot. Fails with a
+    /// split irqchip, whose IOAPIC isn't KVM's.
+    #[cfg(target_arch = "x86_64")]
+    pub fn save_snapshot(&self) -> std::result::Result<Vec<u8>, String> {
+        let state = self.save_state().map_err(|e| e.to_string())?;
+        let mut clock = state.clock;
+        // Restored as it was: with KVM_CLOCK_REALTIME, KVM_SET_CLOCK would
+        // advance it by the time the VM spent saved.
+        clock.flags = 0;
+        let saved = (
+            pod_bytes(&state.pitstate),
+            pod_bytes(&clock),
+            pod_bytes(&state.pic_master),
+            pod_bytes(&state.pic_slave),
+            pod_bytes(&state.ioapic),
+        );
+        bincode::encode_to_vec(saved, bincode::config::standard()).map_err(|e| e.to_string())
+    }
+
+    /// Loads what [`Vm::save_snapshot`] saved, before the vCPUs run.
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_snapshot(&self, bytes: &[u8]) -> std::result::Result<(), String> {
+        type Saved = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+        let ((pit, clock, pic_master, pic_slave, ioapic), _): (Saved, _) =
+            bincode::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| format!("vm state: {e}"))?;
+        let state = VmState {
+            pitstate: pod_from(&pit)?,
+            clock: pod_from(&clock)?,
+            pic_master: pod_from(&pic_master)?,
+            pic_slave: pod_from(&pic_slave)?,
+            ioapic: pod_from(&ioapic)?,
+        };
+        self.restore_state(&state).map_err(|e| e.to_string())
     }
 
     #[allow(unused)]
@@ -1690,6 +1730,13 @@ impl Vcpu {
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
             }
+            Ok(VcpuEvent::Snapshot) => {
+                self.response_sender
+                    .send(VcpuResponse::Snapshotted(Err(
+                        "a running vcpu can't be snapshotted".into(),
+                    )))
+                    .expect("failed to send snapshot");
+            }
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
                 // Move to 'exited' state.
@@ -1700,6 +1747,119 @@ impl Vcpu {
         }
 
         state
+    }
+
+    /// The vCPU's state for a snapshot: every register KVM lists, and its
+    /// multiprocessing state.
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_snapshot(&self) -> std::result::Result<Vec<u8>, String> {
+        // As many as kvm-bindings allows, which is more than KVM lists.
+        let mut list = RegList::new(500).map_err(|e| format!("register list: {e:?}"))?;
+        self.fd
+            .get_reg_list(&mut list)
+            .map_err(|e| format!("register list: {e}"))?;
+        let mut regs = Vec::with_capacity(list.as_slice().len());
+        for &id in list.as_slice() {
+            let mut value = vec![0u8; reg_size(id)];
+            self.fd
+                .get_one_reg(id, &mut value)
+                .map_err(|e| format!("register {id:#x}: {e}"))?;
+            regs.push((id, value));
+        }
+        let mp_state = self
+            .fd
+            .get_mp_state()
+            .map_err(|e| format!("mp state: {e}"))?
+            .mp_state;
+        let state = Aarch64VcpuSnapshot { mp_state, regs };
+        bincode::encode_to_vec(&state, bincode::config::standard()).map_err(|e| e.to_string())
+    }
+
+    /// Sets the guest's virtual counter.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_counter(&self, counter: u64) -> std::result::Result<(), String> {
+        write_counter(&self.fd, counter).map_err(|e| format!("{e:?}"))
+    }
+
+    /// Loads what [`Vcpu::save_snapshot`] saved into a vCPU that hasn't run.
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_snapshot(&mut self, bytes: &[u8]) -> std::result::Result<(), String> {
+        let state = Aarch64VcpuSnapshot::decode(bytes)?;
+        for (id, value) in &state.regs {
+            if value.len() != reg_size(*id) {
+                return Err(format!("register {id:#x}: {} bytes saved", value.len()));
+            }
+            self.fd
+                .set_one_reg(*id, value)
+                .map_err(|e| format!("register {id:#x}: {e}"))?;
+        }
+        self.fd
+            .set_mp_state(kvm_mp_state {
+                mp_state: state.mp_state,
+            })
+            .map_err(|e| format!("mp state: {e}"))
+    }
+
+    /// The vCPU's state for a snapshot: its registers, MSRs, LAPIC and
+    /// pending events.
+    #[cfg(target_arch = "x86_64")]
+    pub fn save_snapshot(&self) -> std::result::Result<Vec<u8>, String> {
+        let state = self.save_state().map_err(|e| e.to_string())?;
+        let saved = X86VcpuSnapshot {
+            msrs: state
+                .msrs
+                .as_slice()
+                .iter()
+                .map(|m| (m.index, m.data))
+                .collect(),
+            debug_regs: pod_bytes(&state.debug_regs),
+            lapic: pod_bytes(&state.lapic),
+            mp_state: state.mp_state.mp_state,
+            regs: pod_bytes(&state.regs),
+            sregs: pod_bytes(&state.sregs),
+            vcpu_events: pod_bytes(&state.vcpu_events),
+            xcrs: pod_bytes(&state.xcrs),
+            xsave: pod_bytes(&state.xsave),
+        };
+        bincode::encode_to_vec(&saved, bincode::config::standard()).map_err(|e| e.to_string())
+    }
+
+    /// Loads what [`Vcpu::save_snapshot`] saved into a vCPU that hasn't run.
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_snapshot(&mut self, bytes: &[u8]) -> std::result::Result<(), String> {
+        let (saved, _): (X86VcpuSnapshot, _) =
+            bincode::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| format!("vcpu state: {e}"))?;
+        let mut msrs = Msrs::new(saved.msrs.len()).map_err(|e| format!("msrs: {e:?}"))?;
+        for (entry, (index, data)) in msrs.as_mut_slice().iter_mut().zip(&saved.msrs) {
+            entry.index = *index;
+            entry.data = *data;
+        }
+        let state = VcpuState {
+            cpuid: self.cpuid.clone(),
+            msrs,
+            debug_regs: pod_from(&saved.debug_regs)?,
+            lapic: pod_from(&saved.lapic)?,
+            mp_state: kvm_mp_state {
+                mp_state: saved.mp_state,
+            },
+            regs: pod_from(&saved.regs)?,
+            sregs: pod_from(&saved.sregs)?,
+            vcpu_events: pod_from(&saved.vcpu_events)?,
+            xcrs: pod_from(&saved.xcrs)?,
+            xsave: pod_from(&saved.xsave)?,
+        };
+        self.restore_state(state).map_err(|e| e.to_string())
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn save_snapshot(&self) -> std::result::Result<Vec<u8>, String> {
+        Err("snapshots are not supported on riscv64".into())
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn restore_snapshot(&mut self, _bytes: &[u8]) -> std::result::Result<(), String> {
+        Err("snapshots are not supported on riscv64".into())
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1755,6 +1915,12 @@ impl Vcpu {
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
                 StateMachine::next(Self::running)
+            }
+            Ok(VcpuEvent::Snapshot) => {
+                self.response_sender
+                    .send(VcpuResponse::Snapshotted(self.save_snapshot()))
+                    .expect("failed to send snapshot");
+                StateMachine::next(Self::paused)
             }
             // All other events have no effect on current 'paused' state.
             Ok(_) => StateMachine::next(Self::paused),
@@ -1829,6 +1995,81 @@ pub struct VcpuState {
     xsave: kvm_xsave,
 }
 
+/// Version of a vCPU's snapshot section.
+pub const VCPU_SNAPSHOT_VERSION: u8 = 1;
+
+#[cfg(target_arch = "aarch64")]
+#[derive(bincode::Encode, bincode::Decode)]
+struct Aarch64VcpuSnapshot {
+    mp_state: u32,
+    regs: Vec<(u64, Vec<u8>)>,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Aarch64VcpuSnapshot {
+    fn decode(bytes: &[u8]) -> std::result::Result<Self, String> {
+        bincode::decode_from_slice(bytes, bincode::config::standard())
+            .map(|(state, _)| state)
+            .map_err(|e| format!("vcpu state: {e}"))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(bincode::Encode, bincode::Decode)]
+struct X86VcpuSnapshot {
+    msrs: Vec<(u32, u64)>,
+    debug_regs: Vec<u8>,
+    lapic: Vec<u8>,
+    mp_state: u32,
+    regs: Vec<u8>,
+    sregs: Vec<u8>,
+    vcpu_events: Vec<u8>,
+    xcrs: Vec<u8>,
+    xsave: Vec<u8>,
+}
+
+/// The bytes of a KVM structure, which is plain data.
+#[cfg(target_arch = "x86_64")]
+fn pod_bytes<T>(value: &T) -> Vec<u8> {
+    // SAFETY: KVM's structures are plain data with no pointers, so any value
+    // is a valid sequence of bytes.
+    unsafe { slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }.to_vec()
+}
+
+/// A KVM structure from the bytes [`pod_bytes`] gave.
+#[cfg(target_arch = "x86_64")]
+fn pod_from<T>(bytes: &[u8]) -> std::result::Result<T, String> {
+    if bytes.len() != size_of::<T>() {
+        return Err(format!(
+            "vcpu state: {} bytes for a {}-byte structure",
+            bytes.len(),
+            size_of::<T>()
+        ));
+    }
+    // SAFETY: the length matches, and any bytes are a valid value of a KVM
+    // structure, which is plain data.
+    Ok(unsafe { ptr::read_unaligned(bytes.as_ptr() as *const T) })
+}
+
+/// The guest's virtual counter in a vCPU's snapshot section.
+#[cfg(target_arch = "aarch64")]
+pub fn snapshot_counter(bytes: &[u8]) -> std::result::Result<u64, String> {
+    let state = Aarch64VcpuSnapshot::decode(bytes)?;
+    state
+        .regs
+        .iter()
+        .find(|(id, _)| *id == TIMER_CNT)
+        .and_then(|(_, value)| value.as_slice().try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| "vcpu state has no virtual counter".to_string())
+}
+
+/// A register's size in bytes, from its id.
+#[cfg(target_arch = "aarch64")]
+fn reg_size(id: u64) -> usize {
+    1 << ((id & kvm_bindings::KVM_REG_SIZE_MASK) >> kvm_bindings::KVM_REG_SIZE_SHIFT)
+}
+
 // Allow currently unused Pause and Exit events. These will be used by the vmm later on.
 #[allow(unused)]
 #[derive(Debug)]
@@ -1841,6 +2082,8 @@ pub enum VcpuEvent {
     /// Resume the Vcpu with the guest's virtual counter at the given value.
     #[cfg(target_arch = "aarch64")]
     ResumeAt(u64),
+    /// Report the paused Vcpu's state for a snapshot.
+    Snapshot,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1856,6 +2099,8 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// The paused Vcpu's state, for a snapshot.
+    Snapshotted(std::result::Result<Vec<u8>, String>),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.

@@ -39,6 +39,16 @@ impl IrqChipDevice {
     pub fn clear_irq(&self, irq_line: Option<u32>) -> Result<(), DeviceError> {
         self.inner.clear_irq(irq_line)
     }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_state(&self, mpidrs: &[u64]) -> Result<Vec<u8>, DeviceError> {
+        self.inner.save_state(mpidrs)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_state(&self, mpidrs: &[u64], state: &[u8]) -> Result<(), DeviceError> {
+        self.inner.restore_state(mpidrs, state)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -143,6 +153,21 @@ pub trait IrqChipT: BusDevice + GICDevice {
 
     fn clear_irq(&self, _irq_line: Option<u32>) -> Result<(), DeviceError> {
         Ok(())
+    }
+
+    /// The interrupt controller's state for a snapshot, with the vCPUs
+    /// paused. `mpidrs` names each vCPU's redistributor and CPU interface.
+    fn save_state(&self, _mpidrs: &[u64]) -> Result<Vec<u8>, DeviceError> {
+        Err(DeviceError::Snapshot(
+            "this interrupt controller can't be snapshotted".into(),
+        ))
+    }
+
+    /// Loads what [`IrqChipT::save_state`] saved, before the vCPUs run.
+    fn restore_state(&self, _mpidrs: &[u64], _state: &[u8]) -> Result<(), DeviceError> {
+        Err(DeviceError::Snapshot(
+            "this interrupt controller can't be snapshotted".into(),
+        ))
     }
 }
 
