@@ -329,3 +329,42 @@ fn the_region_is_whole_memory_blocks() {
     assert!(Mem::new(64 << 20).is_err());
     assert!(Mem::new(128 << 20).is_ok());
 }
+
+#[test]
+fn a_snapshot_keeps_what_is_plugged_and_requested() {
+    let h = Harness::new();
+    let queue = VirtQueue::new(GuestAddress(0), &h.mem, QUEUE_SIZE);
+    h.activate(&queue);
+    h.set_requested(4 * BLOCK_SIZE);
+    assert_eq!(
+        h.request(&queue, VIRTIO_MEM_REQ_PLUG, block(1), 2).0,
+        VIRTIO_MEM_RESP_ACK
+    );
+    let state = {
+        let mut dev = h.dev.lock().unwrap();
+        assert_eq!(dev.pause().unwrap().len(), 1);
+        dev.save_state()
+    };
+
+    let restored = Harness::new();
+    restored.dev.lock().unwrap().restore_state(&state).unwrap();
+    let queue = VirtQueue::new(GuestAddress(0), &restored.mem, QUEUE_SIZE);
+    restored.activate(&queue);
+    let config = restored.config();
+    assert_eq!(config.requested_size, 4 * BLOCK_SIZE);
+    assert_eq!(config.plugged_size, 2 * BLOCK_SIZE);
+    assert_eq!(
+        restored.request(&queue, VIRTIO_MEM_REQ_STATE, block(1), 2),
+        (VIRTIO_MEM_RESP_ACK, VIRTIO_MEM_STATE_PLUGGED)
+    );
+    assert_eq!(
+        restored
+            .request(&queue, VIRTIO_MEM_REQ_UNPLUG, block(2), 1)
+            .0,
+        VIRTIO_MEM_RESP_ACK
+    );
+
+    let mut other = Mem::new(2 * REGION_SIZE).unwrap();
+    assert!(other.restore_state(&state).is_err());
+    assert!(other.restore_state(&state[..4]).is_err());
+}
