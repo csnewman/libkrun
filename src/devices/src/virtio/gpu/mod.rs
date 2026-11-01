@@ -1,5 +1,8 @@
 mod device;
 mod protocol;
+mod record;
+#[cfg(target_os = "linux")]
+mod snapshot;
 mod virtio_gpu;
 mod worker;
 

@@ -2,12 +2,13 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
-use utils::eventfd::EventFd;
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 
-#[cfg(target_os = "macos")]
-use crossbeam_channel::Sender;
 use rutabaga_gfx::{
     RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
     ResourceCreateBlob, RutabagaFence, Transfer3D,
@@ -29,6 +30,52 @@ use crate::virtio::gpu::virtio_gpu::VirtioGpuRing;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 use krun_display::DisplayBackend;
 use krun_display::Rect;
+
+/// What the device asks of a running worker.
+enum Request {
+    /// Stop serving once nothing is in flight, save the GPU's state, answer
+    /// with it, and wait for `Resume`.
+    Pause(Sender<Result<Vec<u8>, String>>),
+    Resume,
+}
+
+/// A running worker. The renderer lives on the worker's thread, so whatever
+/// touches it is asked of the thread.
+pub struct WorkerHandle {
+    requests: Sender<Request>,
+    wake: EventFd,
+}
+
+impl WorkerHandle {
+    fn ask(&self, request: Request) {
+        let _ = self.requests.send(request);
+        let _ = self.wake.write(1);
+    }
+
+    /// Stops the worker between commands, with every fenced command
+    /// retired, and returns the GPU's state for a snapshot.
+    pub fn pause(&self) -> Result<Vec<u8>, String> {
+        let (reply, saved) = unbounded();
+        self.ask(Request::Pause(reply));
+        saved
+            .recv()
+            .map_err(|_| "the gpu worker has stopped".to_string())?
+    }
+
+    pub fn resume(&self) {
+        self.ask(Request::Resume);
+    }
+}
+
+/// Saved state for a new worker to build again before it serves the guest,
+/// and where to answer once it has.
+pub struct Restore {
+    pub state: Vec<u8>,
+    pub done: Sender<Result<(), String>>,
+}
+
+/// How long a pause waits for the renderer to retire the fences in flight.
+const FENCE_WAIT: Duration = Duration::from_secs(5);
 
 pub struct Worker {
     control_evt: EventFd,
@@ -80,14 +127,27 @@ impl Worker {
         }
     }
 
-    pub fn run(self) {
-        thread::Builder::new()
-            .name("gpu worker".into())
-            .spawn(|| self.work())
-            .unwrap();
+    pub fn control_queue(&self) -> Arc<Mutex<VirtQueue>> {
+        self.control_queue.clone()
     }
 
-    fn work(mut self) {
+    /// Starts the worker. With `restore`, it first builds the GPU's saved
+    /// state again, and answers on the channel when done.
+    pub fn run(self, restore: Option<Restore>) -> WorkerHandle {
+        let (requests, received) = unbounded();
+        let wake = EventFd::new(EFD_NONBLOCK).unwrap();
+        let handle = WorkerHandle {
+            requests,
+            wake: wake.try_clone().unwrap(),
+        };
+        thread::Builder::new()
+            .name("gpu worker".into())
+            .spawn(move || self.work(received, wake, restore))
+            .unwrap();
+        handle
+    }
+
+    fn work(mut self, requests: Receiver<Request>, wake: EventFd, restore: Option<Restore>) {
         let mut virtio_gpu = VirtioGpu::new(
             self.mem.clone(),
             self.control_queue.clone(),
@@ -100,7 +160,50 @@ impl Worker {
             self.display_backend,
         );
 
+        if let Some(restore) = restore {
+            let _ = restore
+                .done
+                .send(self.restore(&mut virtio_gpu, &restore.state));
+        }
+
+        let mut fds = [
+            libc::pollfd {
+                fd: self.control_evt.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
         loop {
+            // SAFETY: fds is a valid array of two pollfds.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+                continue;
+            }
+            if fds[1].revents & libc::POLLIN != 0 {
+                let _ = wake.read();
+                while let Ok(request) = requests.try_recv() {
+                    if let Request::Pause(reply) = request {
+                        let _ = reply.send(self.save(&mut virtio_gpu));
+                        // Paused until the device resumes it, or goes away.
+                        loop {
+                            match requests.recv() {
+                                Ok(Request::Resume) => break,
+                                Ok(Request::Pause(reply)) => {
+                                    let _ = reply.send(Err("already paused".into()));
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                    }
+                }
+            }
+            if fds[0].revents & libc::POLLIN == 0 {
+                continue;
+            }
             if let Err(e) = self.control_evt.read() {
                 error!("Failed to read control_evt: {e:?}");
                 continue;
@@ -113,6 +216,32 @@ impl Worker {
         }
     }
 
+    /// Waits for the fenced commands to retire, since retiring one writes the
+    /// used ring, and saves the GPU's state.
+    fn save(&self, virtio_gpu: &mut VirtioGpu) -> Result<Vec<u8>, String> {
+        let deadline = Instant::now() + FENCE_WAIT;
+        while !virtio_gpu.fence_state.lock().unwrap().is_idle() {
+            if Instant::now() > deadline {
+                return Err("gpu commands are still in flight".into());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        #[cfg(target_os = "linux")]
+        return virtio_gpu.save_session();
+        #[cfg(not(target_os = "linux"))]
+        Err("gpu snapshots are not supported on this platform".into())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore(&self, virtio_gpu: &mut VirtioGpu, state: &[u8]) -> Result<(), String> {
+        virtio_gpu.restore_session(state, &self.mem, &self.shm_region)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn restore(&self, _virtio_gpu: &mut VirtioGpu, _state: &[u8]) -> Result<(), String> {
+        Err("gpu snapshots are not supported on this platform".into())
+    }
+
     fn process_gpu_command(
         &mut self,
         virtio_gpu: &mut VirtioGpu,
@@ -122,6 +251,10 @@ impl Worker {
         reader: &mut Reader,
     ) -> VirtioGpuResult {
         virtio_gpu.force_ctx_0();
+
+        if let Some(resp) = virtio_gpu.lost_command(hdr.ctx_id, &cmd) {
+            return resp;
+        }
 
         match cmd {
             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),

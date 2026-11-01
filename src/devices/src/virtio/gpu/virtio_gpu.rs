@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::io::IoSliceMut;
+use std::io::{self, IoSliceMut};
 #[cfg(target_os = "linux")]
-use std::os::unix::io::{AsFd, AsRawFd};
+use std::os::unix::io::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +41,8 @@ use rutabaga_gfx::{
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
+use super::protocol::GpuCommand;
+use super::record::{self, Blob, Context, Kind, Resource, RingChange, Session};
 use super::{GpuError, Result};
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
@@ -123,6 +125,13 @@ pub struct FenceState {
     completed_fences: BTreeMap<VirtioGpuRing, u64>,
 }
 
+impl FenceState {
+    /// No command waits on a fence to be answered.
+    pub fn is_idle(&self) -> bool {
+        self.descs.is_empty()
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 struct AssociatedScanouts(u32);
 
@@ -183,10 +192,25 @@ pub struct VirtioGpuScanout {
     resource_id: u32,
 }
 
+/// The resources and contexts a guest had that didn't survive a restore. The
+/// guest still names them, and is told they are gone.
+#[derive(Default)]
+pub struct Lost {
+    pub resources: BTreeSet<u32>,
+    pub contexts: BTreeSet<u32>,
+    /// Blobs of a lost Venus context that another context still uses, made
+    /// again as blank textures. The guest still takes them for blobs.
+    pub stand_ins: BTreeSet<u32>,
+}
+
 pub struct VirtioGpu {
-    rutabaga: Rutabaga,
+    pub(super) rutabaga: Rutabaga,
     resources: BTreeMap<u32, VirtioGpuResource>,
-    fence_state: Arc<Mutex<FenceState>>,
+    pub(super) fence_state: Arc<Mutex<FenceState>>,
+    pub(super) rec: Session,
+    pub(super) lost: Lost,
+    #[cfg(target_os = "linux")]
+    blob_fds: BTreeMap<u32, (OwnedFd, u32)>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
@@ -385,6 +409,10 @@ impl VirtioGpu {
             rutabaga,
             resources: Default::default(),
             fence_state,
+            rec: Session::default(),
+            lost: Lost::default(),
+            #[cfg(target_os = "linux")]
+            blob_fds: BTreeMap::new(),
             scanouts: Default::default(),
             displays,
             display_backend,
@@ -412,6 +440,55 @@ impl VirtioGpu {
             }
             Err(_) => OkNoData,
         }
+    }
+
+    /// The answer to a command that names a resource or context lost in a
+    /// restore. Releasing one is the guest agreeing it's gone, and succeeds;
+    /// any other use is refused, rather than deeper down where it would look
+    /// like the guest made the id up.
+    pub fn lost_command(&mut self, ctx_id: u32, cmd: &GpuCommand) -> Option<VirtioGpuResult> {
+        if self.lost.resources.is_empty()
+            && self.lost.contexts.is_empty()
+            && self.lost.stand_ins.is_empty()
+        {
+            return None;
+        }
+        let resource_id = match cmd {
+            GpuCommand::CtxCreate(_) => return None,
+            GpuCommand::CtxDestroy(_) if self.lost.contexts.remove(&ctx_id) => {
+                return Some(Ok(OkNoData));
+            }
+            GpuCommand::ResourceUnref(info) if self.lost.resources.remove(&info.resource_id) => {
+                return Some(Ok(OkNoData));
+            }
+            GpuCommand::ResourceUnref(info) => {
+                self.lost.stand_ins.remove(&info.resource_id);
+                Some(info.resource_id)
+            }
+            GpuCommand::ResourceMapBlob(info)
+                if self.lost.stand_ins.contains(&info.resource_id) =>
+            {
+                return Some(Err(ErrUnspec));
+            }
+            GpuCommand::ResourceUnmapBlob(info)
+                if self.lost.stand_ins.contains(&info.resource_id) =>
+            {
+                return Some(Ok(OkNoData));
+            }
+            GpuCommand::ResourceAttachBacking(info) => Some(info.resource_id),
+            GpuCommand::ResourceDetachBacking(info) => Some(info.resource_id),
+            GpuCommand::TransferToHost2d(info) => Some(info.resource_id),
+            GpuCommand::ResourceMapBlob(info) => Some(info.resource_id),
+            GpuCommand::ResourceUnmapBlob(info) => Some(info.resource_id),
+            _ => None,
+        };
+        if ctx_id != 0 && self.lost.contexts.contains(&ctx_id) {
+            return Some(Err(ErrInvalidContextId));
+        }
+        if resource_id.is_some_and(|id| self.lost.resources.contains(&id)) {
+            return Some(Err(ErrInvalidResourceId));
+        }
+        None
     }
 
     pub fn force_ctx_0(&self) {
@@ -445,6 +522,11 @@ impl VirtioGpu {
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
+        self.lost.resources.remove(&resource_id);
+        self.rec.resources.insert(
+            resource_id,
+            Resource::new(Kind::ThreeD(resource_create_3d.into())),
+        );
         Ok(self.result_from_query(resource_id))
     }
 
@@ -468,6 +550,9 @@ impl VirtioGpu {
         }
 
         self.rutabaga.unref_resource(resource_id)?;
+        #[cfg(target_os = "linux")]
+        self.blob_fds.remove(&resource_id);
+        self.rec.forget(resource_id);
         Ok(OkNoData)
     }
 
@@ -499,6 +584,7 @@ impl VirtioGpu {
             debug!("Disabling scanout {scanout_id:?}");
             *scanout = None;
             self.display_backend.disable_scanout(scanout_id)?;
+            self.rec.scanouts.remove(&scanout_id);
             return Ok(OkNoData);
         }
 
@@ -529,6 +615,7 @@ impl VirtioGpu {
         )?;
 
         *scanout = Some(VirtioGpuScanout { resource_id });
+        self.rec.scanouts.insert(scanout_id, resource_id);
         Ok(OkNoData)
     }
 
@@ -647,12 +734,18 @@ impl VirtioGpu {
     ) -> VirtioGpuResult {
         let rutabaga_iovecs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
         self.rutabaga.attach_backing(resource_id, rutabaga_iovecs)?;
+        if let Some(r) = self.rec.resources.get_mut(&resource_id) {
+            r.backing = Some(record::entries(&vecs));
+        }
         Ok(OkNoData)
     }
 
     /// Detaches any previously attached iovecs from the resource.
     pub fn detach_backing(&mut self, resource_id: u32) -> VirtioGpuResult {
         self.rutabaga.detach_backing(resource_id)?;
+        if let Some(r) = self.rec.resources.get_mut(&resource_id) {
+            r.backing = None;
+        }
         Ok(OkNoData)
     }
 
@@ -697,24 +790,36 @@ impl VirtioGpu {
     ) -> VirtioGpuResult {
         self.rutabaga
             .create_context(ctx_id, context_init, context_name)?;
+        self.lost.contexts.remove(&ctx_id);
+        self.rec.contexts.insert(
+            ctx_id,
+            Context::new(context_init, context_name.map(String::from)),
+        );
         Ok(OkNoData)
     }
 
     /// Destroys a rutabaga context.
     pub fn destroy_context(&mut self, ctx_id: u32) -> VirtioGpuResult {
         self.rutabaga.destroy_context(ctx_id)?;
+        self.rec.contexts.remove(&ctx_id);
         Ok(OkNoData)
     }
 
     /// Attaches a resource to a rutabaga context.
     pub fn context_attach_resource(&mut self, ctx_id: u32, resource_id: u32) -> VirtioGpuResult {
         self.rutabaga.context_attach_resource(ctx_id, resource_id)?;
+        if let Some(c) = self.rec.contexts.get_mut(&ctx_id) {
+            c.attached.insert(resource_id);
+        }
         Ok(OkNoData)
     }
 
     /// Detaches a resource from a rutabaga context.
     pub fn context_detach_resource(&mut self, ctx_id: u32, resource_id: u32) -> VirtioGpuResult {
         self.rutabaga.context_detach_resource(ctx_id, resource_id)?;
+        if let Some(c) = self.rec.contexts.get_mut(&ctx_id) {
+            c.attached.remove(&resource_id);
+        }
         Ok(OkNoData)
     }
 
@@ -726,6 +831,17 @@ impl VirtioGpu {
         fence_ids: &[u64],
     ) -> VirtioGpuResult {
         self.rutabaga.submit_command(ctx_id, commands, fence_ids)?;
+        if let Some(c) = self.rec.contexts.get_mut(&ctx_id) {
+            if let Some(v) = c.virgl.as_mut() {
+                v.observe(commands);
+            } else if record::is_venus(c.init) {
+                match record::ring_change(commands) {
+                    Some(RingChange::Created(r)) => c.rings.push(r),
+                    Some(RingChange::Destroyed(id)) => c.rings.retain(|r| r.id != id),
+                    None => {}
+                }
+            }
+        }
         Ok(OkNoData)
     }
 
@@ -790,6 +906,18 @@ impl VirtioGpu {
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
+        self.lost.resources.remove(&resource_id);
+        self.rec.resources.insert(
+            resource_id,
+            Resource::new(Kind::Blob(Blob {
+                ctx_id,
+                blob_mem: resource_create_blob.blob_mem,
+                blob_flags: resource_create_blob.blob_flags,
+                blob_id: resource_create_blob.blob_id,
+                size: resource_create_blob.size,
+                entries: record::entries(&vecs),
+            })),
+        );
         Ok(self.result_from_query(resource_id))
     }
 
@@ -806,56 +934,54 @@ impl VirtioGpu {
         shm_region: &VirtioShmRegion,
         offset: u64,
     ) -> VirtioGpuResult {
+        let size = self
+            .resources
+            .get(&resource_id)
+            .ok_or(ErrInvalidResourceId)?
+            .size;
+
+        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+
+        let (fd, handle_type) = self.blob_fd(resource_id).map_err(|_| ErrUnspec)?;
+        if handle_type == RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD {
+            return Err(ErrUnspec);
+        }
+        let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
+            RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
+            RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
+            RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
+            _ => return Err(ErrUnspec),
+        };
+
+        let addr =
+            checked_blob_map_addr(shm_region.host_addr, offset, size, shm_region.size as u64)
+                .ok_or(ErrUnspec)?;
+        debug!(
+            "mapping: host_addr={:x}, addr={:x}, size={}",
+            shm_region.host_addr, addr, size
+        );
+        let ret = unsafe {
+            libc::mmap(
+                addr as *mut libc::c_void,
+                size as usize,
+                prot,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd.as_raw_fd(),
+                0 as libc::off_t,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            return Err(ErrUnspec);
+        }
+
         let resource = self
             .resources
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
-
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-
-        if let Ok(export) = self.rutabaga.export_blob(resource_id)
-            && let Some(mesa_handle) = export.as_mesa_handle()
-        {
-            if mesa_handle.handle_type != RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD {
-                let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
-                    RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
-                    RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
-                    RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
-                    _ => return Err(ErrUnspec),
-                };
-
-                let addr = checked_blob_map_addr(
-                    shm_region.host_addr,
-                    offset,
-                    resource.size,
-                    shm_region.size as u64,
-                )
-                .ok_or(ErrUnspec)?;
-                debug!(
-                    "mapping: host_addr={:x}, addr={:x}, size={}",
-                    shm_region.host_addr, addr, resource.size
-                );
-                let ret = unsafe {
-                    libc::mmap(
-                        addr as *mut libc::c_void,
-                        resource.size as usize,
-                        prot,
-                        libc::MAP_SHARED | libc::MAP_FIXED,
-                        mesa_handle.os_handle.as_fd().as_raw_fd(),
-                        0 as libc::off_t,
-                    )
-                };
-                if ret == libc::MAP_FAILED {
-                    return Err(ErrUnspec);
-                }
-            } else {
-                return Err(ErrUnspec);
-            }
-        } else {
-            return Err(ErrUnspec);
-        }
-
         resource.shmem_offset = Some(offset);
+        if let Some(r) = self.rec.resources.get_mut(&resource_id) {
+            r.mapped_at = Some(offset);
+        }
         // Access flags not a part of the virtio-gpu spec.
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
@@ -927,6 +1053,9 @@ impl VirtioGpu {
         }
 
         resource.shmem_offset = Some(offset);
+        if let Some(r) = self.rec.resources.get_mut(&resource_id) {
+            r.mapped_at = Some(offset);
+        }
         // Access flags not a part of the virtio-gpu spec.
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
@@ -983,6 +1112,9 @@ impl VirtioGpu {
         }
 
         resource.shmem_offset = Some(offset);
+        if let Some(r) = self.rec.resources.get_mut(&resource_id) {
+            r.mapped_at = Some(offset);
+        }
         // Access flags not a part of the virtio-gpu spec.
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
@@ -990,6 +1122,31 @@ impl VirtioGpu {
     }
 
     /// Uses the hypervisor to unmap the blob resource.
+    /// A blob's descriptor and its handle type, exported the first time it is
+    /// asked for and kept: a blob that isn't shareable can only be exported
+    /// once.
+    #[cfg(target_os = "linux")]
+    pub(super) fn blob_fd(
+        &mut self,
+        resource_id: u32,
+    ) -> std::result::Result<(OwnedFd, u32), String> {
+        let e = |e: io::Error| e.to_string();
+        if let Some((fd, handle_type)) = self.blob_fds.get(&resource_id) {
+            return Ok((fd.try_clone().map_err(e)?, *handle_type));
+        }
+        let export = self
+            .rutabaga
+            .export_blob(resource_id)
+            .map_err(|e| e.to_string())?;
+        let handle = export
+            .as_mesa_handle()
+            .ok_or("the blob has no descriptor")?;
+        let fd = handle.os_handle.as_fd().try_clone_to_owned().map_err(e)?;
+        let copy = fd.try_clone().map_err(e)?;
+        self.blob_fds.insert(resource_id, (fd, handle.handle_type));
+        Ok((copy, handle.handle_type))
+    }
+
     #[cfg(target_os = "linux")]
     pub fn resource_unmap_blob(
         &mut self,
@@ -1021,6 +1178,9 @@ impl VirtioGpu {
         }
 
         resource.shmem_offset = None;
+        if let Some(r) = self.rec.resources.get_mut(&resource_id) {
+            r.mapped_at = None;
+        }
 
         Ok(OkNoData)
     }
@@ -1057,6 +1217,9 @@ impl VirtioGpu {
         }
 
         resource.shmem_offset = None;
+        if let Some(r) = self.rec.resources.get_mut(&resource_id) {
+            r.mapped_at = None;
+        }
 
         Ok(OkNoData)
     }
