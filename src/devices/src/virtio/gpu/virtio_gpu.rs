@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io;
 use std::io::IoSliceMut;
 #[cfg(target_os = "linux")]
-use std::os::unix::io::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::io::AsRawFd;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::io::{AsFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -213,7 +215,7 @@ pub struct VirtioGpu {
     pub(super) fence_state: Arc<Mutex<FenceState>>,
     pub(super) rec: Session,
     pub(super) lost: Lost,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     blob_fds: BTreeMap<u32, (OwnedFd, u32)>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
@@ -415,7 +417,7 @@ impl VirtioGpu {
             fence_state,
             rec: Session::default(),
             lost: Lost::default(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             blob_fds: BTreeMap::new(),
             scanouts: Default::default(),
             displays,
@@ -563,7 +565,7 @@ impl VirtioGpu {
         }
 
         self.rutabaga.unref_resource(resource_id)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.blob_fds.remove(&resource_id);
         self.rec.forget(resource_id);
         Ok(OkNoData)
@@ -1089,6 +1091,11 @@ impl VirtioGpu {
         shm_region: &VirtioShmRegion,
         offset: u64,
     ) -> VirtioGpuResult {
+        // Through blob_fd, which keeps the export: a snapshot reads the blob
+        // through it, and a blob can be exported only once.
+        let exported = self
+            .blob_fd(resource_id)
+            .map(|(_, handle_type)| handle_type);
         let resource = self
             .resources
             .get_mut(&resource_id)
@@ -1097,10 +1104,8 @@ impl VirtioGpu {
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
         let map_ptr = self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?.ptr;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id)
-            && let Some(mesa_handle) = export.as_mesa_handle()
-        {
-            if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
+        if let Ok(handle_type) = exported {
+            if handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
                 let guest_addr = checked_blob_map_addr(
                     shm_region.guest_addr,
                     offset,
@@ -1146,7 +1151,7 @@ impl VirtioGpu {
     /// A blob's descriptor and its handle type, exported the first time it is
     /// asked for and kept: a blob that isn't shareable can only be exported
     /// once.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn blob_fd(
         &mut self,
         resource_id: u32,

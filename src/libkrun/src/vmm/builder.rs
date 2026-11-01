@@ -1425,7 +1425,7 @@ pub fn build_microvm(
         intc: intc.clone(),
         #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
         vcpu_mpidrs: Vec::new(),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         shared_memory: _shm_manager
             .regions()
             .into_iter()
@@ -2772,7 +2772,7 @@ fn restore_snapshot(
         return Err("the snapshot's sections don't match its manifest".into());
     }
 
-    read_memory(&vmm.guest_memory, &snap.memory).map_err(|e| e.to_string())?;
+    read_memory(&vmm.guest_memory, &vmm.shared_memory, &snap.memory).map_err(|e| e.to_string())?;
 
     for ((id, device), (saved_id, state)) in devices.iter().zip(&snap.devices) {
         if id != saved_id {

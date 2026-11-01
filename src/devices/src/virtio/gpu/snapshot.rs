@@ -639,13 +639,7 @@ fn restore_venus_context(ctx_id: u32) -> impl FnOnce(&[u8]) -> Result<(), String
         let Some((_, restore)) = venus_snapshot() else {
             return Err("the renderer can't restore it".into());
         };
-        // SAFETY: a new anonymous file, owned here.
-        let fd = unsafe { libc::memfd_create(c"krun-venus".as_ptr(), libc::MFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error().to_string());
-        }
-        // SAFETY: fd was just created, and is owned here.
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        let mut file = anonymous_file().map_err(|e| e.to_string())?;
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let fd = OwnedFd::from(file);
@@ -656,4 +650,37 @@ fn restore_venus_context(ctx_id: u32) -> impl FnOnce(&[u8]) -> Result<(), String
         }
         Ok(())
     }
+}
+
+/// A new file with no name, which is gone once closed.
+#[cfg(target_os = "linux")]
+fn anonymous_file() -> io::Result<File> {
+    // SAFETY: a new anonymous file, owned here.
+    let fd = unsafe { libc::memfd_create(c"krun-venus".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd was just created, and is owned here.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// A new file with no name, which is gone once closed. macOS has no
+/// memfd_create, so it is a temporary file, unlinked as soon as it's open.
+#[cfg(target_os = "macos")]
+fn anonymous_file() -> io::Result<File> {
+    let mut path = std::env::temp_dir()
+        .join("krun-venus-XXXXXX")
+        .into_os_string()
+        .into_encoded_bytes();
+    path.push(0);
+    // SAFETY: path is a NUL-terminated template, which mkstemp fills in.
+    let fd = unsafe { libc::mkstemp(path.as_mut_ptr().cast()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd was just created, and is owned here.
+    let file = unsafe { File::from_raw_fd(fd) };
+    // SAFETY: the path mkstemp filled in, still NUL-terminated.
+    unsafe { libc::unlink(path.as_ptr().cast()) };
+    Ok(file)
 }
