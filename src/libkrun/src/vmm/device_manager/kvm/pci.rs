@@ -59,14 +59,18 @@ type Result<T> = std::result::Result<T, Error>;
 /// A function as the guest is told of it: by ACPI on x86_64, by the device
 /// tree on aarch64.
 #[cfg(target_arch = "x86_64")]
-pub type PciFunctionInfo = arch::x86_64::PciFunctionInfo;
+pub use arch::x86_64::PciFunctionInfo;
 #[cfg(target_arch = "aarch64")]
-pub type PciFunctionInfo = devices::fdt::PciFdtFunction;
+pub use devices::fdt::PciFdtFunction as PciFunctionInfo;
 
 #[cfg(target_arch = "aarch64")]
-use arch::aarch64::layout::{PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START};
+use arch::aarch64::layout::{
+    GIC_ITS_SIZE, GIC_ITS_START, PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START,
+};
 #[cfg(target_arch = "x86_64")]
 use arch::x86_64::layout::{PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START};
+#[cfg(target_arch = "aarch64")]
+use devices::fdt::PciFdtInfo;
 
 /// Owns the bus-0 PCI functions and their guest address windows.
 pub struct PciHostManager {
@@ -220,7 +224,7 @@ impl PciHostManager {
             flags: 0,
         };
         let its = vm.create_device(&mut device).map_err(Error::CreateIts)?;
-        let addr = arch::aarch64::layout::GIC_ITS_START;
+        let addr = GIC_ITS_START;
         its.set_device_attr(&kvm_bindings::kvm_device_attr {
             group: kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ADDR,
             attr: u64::from(kvm_bindings::KVM_VGIC_ITS_ADDR_TYPE),
@@ -340,19 +344,14 @@ impl PciHostManager {
     }
 
     #[cfg(target_arch = "aarch64")]
-    pub fn fdt_info(&self) -> devices::fdt::PciFdtInfo {
-        devices::fdt::PciFdtInfo {
+    pub fn fdt_info(&self) -> PciFdtInfo {
+        PciFdtInfo {
             ecam_base: PCI_ECAM_START,
             ecam_size: PCI_ECAM_SIZE,
             bar_base: PCI_BAR_START,
             bar_size: PCI_BAR_END - PCI_BAR_START,
             functions: self.functions.clone(),
-            its: self.its.as_ref().map(|_| {
-                (
-                    arch::aarch64::layout::GIC_ITS_START,
-                    arch::aarch64::layout::GIC_ITS_SIZE,
-                )
-            }),
+            its: self.its.as_ref().map(|_| (GIC_ITS_START, GIC_ITS_SIZE)),
         }
     }
 
@@ -443,6 +442,8 @@ mod msi {
     use std::io;
     use std::sync::{Arc, Mutex};
 
+    #[cfg(target_arch = "aarch64")]
+    use arch::aarch64::layout::KVM_LAST_SPI;
     use devices::pci::PciMsiVectors;
     use kvm_bindings::{
         KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID, KvmIrqRouting,
@@ -461,7 +462,7 @@ mod msi {
     pub const MSI_GSI_BASE: u32 = 24;
     /// The first GSI for MSIs, after the GIC's SPIs.
     #[cfg(target_arch = "aarch64")]
-    pub const MSI_GSI_BASE: u32 = arch::aarch64::layout::KVM_LAST_SPI + 1;
+    pub const MSI_GSI_BASE: u32 = KVM_LAST_SPI + 1;
 
     fn irqchip_route(gsi: u32, irqchip: u32, pin: u32) -> kvm_irq_routing_entry {
         kvm_irq_routing_entry {
@@ -478,7 +479,7 @@ mod msi {
     /// otherwise drop: a GSI for each SPI.
     #[cfg(target_arch = "aarch64")]
     fn default_routes() -> Vec<kvm_irq_routing_entry> {
-        (0..=arch::aarch64::layout::KVM_LAST_SPI)
+        (0..=KVM_LAST_SPI)
             .map(|pin| irqchip_route(pin, 0, pin))
             .collect()
     }

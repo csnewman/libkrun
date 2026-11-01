@@ -75,6 +75,8 @@ use crate::vmm::vstate::KvmContext;
 #[cfg(all(target_os = "linux", feature = "tee"))]
 use crate::vmm::vstate::MeasuredRegion;
 use crate::vmm::vstate::{Error as VstateError, Vcpu, VcpuConfig, Vm};
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+use arch::aarch64::layout::KVM_LAST_SPI;
 use arch::{ArchMemoryInfo, InitrdConfig};
 use device_manager::shm::ShmManager;
 #[cfg(not(target_os = "windows"))]
@@ -1105,7 +1107,7 @@ pub fn build_microvm(
     // so that devices on different transports never share a line. On aarch64
     // KVM a line is an SPI, and the GIC has fewer of them than IRQ_MAX.
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    let irq_last = arch::aarch64::layout::KVM_LAST_SPI;
+    let irq_last = KVM_LAST_SPI;
     #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
     let irq_last = arch::IRQ_MAX;
     let irq_allocator = IrqAllocator::new(arch::IRQ_BASE, irq_last);
