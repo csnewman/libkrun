@@ -822,6 +822,7 @@ pub fn build_microvm(
     let gpu_shm_size = requirements.iter().filter_map(|r| r.gpu_shm).next();
     #[cfg(not(feature = "gpu"))]
     let gpu_shm_size: Option<usize> = None;
+    let hotplug_mem_sizes: Vec<usize> = requirements.iter().filter_map(|r| r.hotplug_mem).collect();
     let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
     #[cfg(target_os = "macos")]
     let ram_in_blocks = requirements.iter().any(|r| r.replaces_guest_ram);
@@ -859,6 +860,7 @@ pub fn build_microvm(
         vm_resources.firmware_config.as_ref(),
         &fs_shm_sizes,
         gpu_shm_size,
+        &hotplug_mem_sizes,
         use_vhost_user,
         &payload,
         #[cfg(target_os = "macos")]
@@ -2058,6 +2060,7 @@ pub fn create_guest_memory(
     firmware_config: Option<&crate::vmm::vmm_config::firmware::FirmwareConfig>,
     fs_shm_sizes: &[Option<usize>],
     gpu_shm_size: Option<usize>,
+    hotplug_mem_sizes: &[usize],
     use_vhost_user: bool,
     payload: &Payload,
     #[cfg(target_os = "macos")] ram_in_blocks: bool,
@@ -2150,10 +2153,19 @@ pub fn create_guest_memory(
     #[cfg(not(feature = "gpu"))]
     let _ = gpu_shm_size;
 
+    for size in hotplug_mem_sizes {
+        shm_manager
+            .create_hotplug_region(*size)
+            .map_err(StartMicrovmError::ShmCreate)?;
+    }
+
     let _ = use_vhost_user;
 
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
+    if let Some(region) = shm_manager.hotplug_region() {
+        arch_mem_regions.push((region.guest_addr, region.size));
+    }
 
     let guest_mem = if use_vhost_user {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -2885,6 +2897,7 @@ pub mod tests {
             None,
             &[],
             None,
+            &[],
             false,
             &Payload::Empty,
             #[cfg(target_os = "macos")]
@@ -2923,8 +2936,18 @@ pub mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_ram_that_cant_be_mapped_in_blocks_is_reported() {
-        let (guest_memory, info, _shm_manager, _payload_config) =
-            create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, false).unwrap();
+        let (guest_memory, info, _shm_manager, _payload_config) = create_guest_memory(
+            64,
+            None,
+            None,
+            &[],
+            None,
+            &[],
+            false,
+            &Payload::Empty,
+            false,
+        )
+        .unwrap();
 
         let mut asked = None;
         let in_blocks = map_ram_in_blocks(&guest_memory, &info, |_, ram| {
