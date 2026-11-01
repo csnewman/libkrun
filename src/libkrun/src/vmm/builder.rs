@@ -1398,6 +1398,12 @@ pub fn build_microvm(
         intc: intc.clone(),
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         vcpu_mpidrs: Vec::new(),
+        #[cfg(target_os = "linux")]
+        shared_memory: _shm_manager
+            .regions()
+            .into_iter()
+            .map(|(addr, _)| addr)
+            .collect(),
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -2601,7 +2607,7 @@ fn restore_snapshot(vmm: &Vmm, vcpus: &mut [Vcpu], dir: &Path) -> std::result::R
         return Err("the snapshot's sections don't match its manifest".into());
     }
 
-    read_memory(&vmm.guest_memory, &snap.memory).map_err(|e| e.to_string())?;
+    read_memory(&vmm.guest_memory, &vmm.shared_memory, &snap.memory).map_err(|e| e.to_string())?;
 
     for (vcpu, (version, state)) in vcpus.iter_mut().zip(&snap.vcpus) {
         if *version != VCPU_SNAPSHOT_VERSION {

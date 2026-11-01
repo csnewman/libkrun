@@ -1,19 +1,22 @@
 use std::io::Write;
 use std::mem::size_of;
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
+use crossbeam_channel::bounded;
+use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
-    VirtioShmRegion, fs::ExportTable,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, PauseError, Queue as VirtQueue,
+    QueueConfig, VirtioDevice, VirtioShmRegion, fs::ExportTable,
 };
 use super::defs;
 use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
 use super::virtio_gpu::virgl_flags_to_capsets;
-use super::worker::Worker;
+use super::worker::{Restore, Worker, WorkerHandle};
 use crate::display::DisplayInfo;
 use crate::virtio::InterruptTransport;
 use krun_display::DisplayBackend;
@@ -45,6 +48,21 @@ pub struct Gpu {
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
     blob_alignment: u32,
+    worker: Option<WorkerHandle>,
+    // The control queue is the worker's, the cursor queue is unused; both are
+    // kept to hand back at a pause.
+    control_queue: Option<(Arc<Mutex<VirtQueue>>, Arc<EventFd>)>,
+    cursor_queue: Option<DeviceQueue>,
+    paused: bool,
+    saved: Vec<u8>,
+    restore: Option<Vec<u8>>,
+}
+
+/// A copy of a queue's state, for the transport to save.
+fn copy_queue(queue: &VirtQueue, event: &Arc<EventFd>) -> DeviceQueue {
+    let mut copy = VirtQueue::new(queue.get_max_size());
+    copy.restore(&queue.snapshot());
+    DeviceQueue::new(copy, event.clone())
 }
 
 impl Gpu {
@@ -68,6 +86,12 @@ impl Gpu {
             // Blobs are mapped into the guest in host pages, which can be
             // larger than the guest's (16 KiB on Apple silicon).
             blob_alignment: unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32,
+            worker: None,
+            control_queue: None,
+            cursor_queue: None,
+            paused: false,
+            saved: Vec::new(),
+            restore: None,
         })
     }
 
@@ -205,7 +229,7 @@ impl VirtioDevice for Gpu {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        let [control_q, _cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
+        let [control_q, cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
             error!(
                 "Cannot perform activate. Expected {} queue(s)",
                 defs::NUM_QUEUES
@@ -218,7 +242,7 @@ impl VirtioDevice for Gpu {
             None => panic!("virtio_gpu: missing SHM region"),
         };
 
-        // cursor queue not used by worker
+        let control_event = control_q.event.clone();
         let worker = Worker::new(
             control_q,
             mem.clone(),
@@ -231,11 +255,74 @@ impl VirtioDevice for Gpu {
             self.displays.clone(),
             self.display_backend,
         );
-        worker.run();
+        self.control_queue = Some((worker.control_queue(), control_event));
+        self.cursor_queue = Some(cursor_q);
+
+        let (restore, restored) = match self.restore.take() {
+            Some(state) => {
+                let (done, restored) = bounded(1);
+                (Some(Restore { state, done }), Some(restored))
+            }
+            None => (None, None),
+        };
+        self.worker = Some(worker.run(restore));
+        // Before the guest runs: the restored blobs must be in the window
+        // when it next reads them.
+        if let Some(restored) = restored {
+            match restored.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!("gpu: restoring its state: {e}");
+                    return Err(ActivateError::BadActivate);
+                }
+                Err(_) => return Err(ActivateError::BadActivate),
+            }
+        }
 
         self.device_state = DeviceState::Activated(mem, interrupt);
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        let (Some(worker), Some((control, event)), Some(cursor)) =
+            (&self.worker, &self.control_queue, &self.cursor_queue)
+        else {
+            return Err(PauseError::Failed("gpu queues are missing".into()));
+        };
+        self.saved = worker.pause().map_err(PauseError::Failed)?;
+        self.paused = true;
+        let control = copy_queue(&control.lock().unwrap(), event);
+        Ok(vec![control, copy_queue(&cursor.queue, &cursor.event)])
+    }
+
+    fn save_state(&self) -> Vec<u8> {
+        self.saved.clone()
+    }
+
+    fn restore_state(&mut self, state: &[u8]) -> std::result::Result<(), crate::Error> {
+        self.restore = (!state.is_empty()).then(|| state.to_vec());
+        Ok(())
+    }
+
+    /// Runs a paused worker again, or on a device restored from a snapshot,
+    /// starts one that first builds the saved state again.
+    fn resume(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        if self.paused {
+            self.paused = false;
+            self.saved = Vec::new();
+            if let Some(worker) = &self.worker {
+                worker.resume();
+            }
+            return Ok(());
+        }
+        self.activate(mem, interrupt, queues)
     }
 
     fn is_activated(&self) -> bool {
