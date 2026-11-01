@@ -82,6 +82,8 @@ use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender};
+#[cfg(target_os = "linux")]
+use vm_memory::GuestAddress;
 use vm_memory::GuestMemoryMmap;
 
 /// Success exit code.
@@ -219,6 +221,10 @@ pub struct Vmm {
     // Each vCPU's MPIDR, which names its GIC redistributor in a snapshot.
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     pub(crate) vcpu_mpidrs: Vec<u64>,
+    // Where the shared memory windows start, which a snapshot leaves to the
+    // devices that map into them.
+    #[cfg(target_os = "linux")]
+    pub(crate) shared_memory: Vec<GuestAddress>,
 }
 
 #[cfg(target_os = "linux")]
@@ -566,8 +572,14 @@ impl Vmm {
             self.vcpus_handles.len() as u8,
             devices.iter().map(|(id, _)| id.clone()).collect(),
         );
-        snapshot::write(dir, &manifest, &writer.finish(), &self.guest_memory)
-            .map_err(|e| e.to_string())
+        snapshot::write(
+            dir,
+            &manifest,
+            &writer.finish(),
+            &self.guest_memory,
+            &self.shared_memory,
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// The interrupt controller's state. On aarch64 the GIC's, whose pending

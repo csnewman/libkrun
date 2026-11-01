@@ -15,7 +15,9 @@ use std::{fmt, slice};
 
 use devices::SavedState;
 use serde::{Deserialize, Serialize};
-use vm_memory::{GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{
+    GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
+};
 
 pub const MANIFEST_NAME: &str = "manifest.json";
 pub const VMSTATE_NAME: &str = "vmstate";
@@ -310,22 +312,36 @@ pub fn write(
     manifest: &Manifest,
     vmstate: &[u8],
     mem: &GuestMemoryMmap,
+    shared: &[GuestAddress],
 ) -> Result<(), SnapErr> {
     fs::create_dir_all(dir)?;
     let json = serde_json::to_vec_pretty(manifest).map_err(|e| SnapErr::State(e.to_string()))?;
     fs::write(dir.join(MANIFEST_NAME), json)?;
     fs::write(dir.join(VMSTATE_NAME), vmstate)?;
-    write_memory(mem, &File::create(dir.join(MEMORY_NAME))?)
+    write_memory(mem, shared, &File::create(dir.join(MEMORY_NAME))?)
 }
 
 const PAGE: usize = 4096;
 
+/// The regions of guest memory a snapshot carries: all but the shared memory
+/// windows devices map their own memory into, which those devices restore.
+fn ram<'a>(
+    mem: &'a GuestMemoryMmap,
+    shared: &'a [GuestAddress],
+) -> impl Iterator<Item = &'a GuestRegionMmap> {
+    mem.iter().filter(|r| !shared.contains(&r.start_addr()))
+}
+
 /// Writes guest RAM to `file`, regions in address order, leaving holes where
 /// pages are zero: a guest's untouched and freed memory costs no disk, and a
 /// restore doesn't touch it.
-pub fn write_memory(mem: &GuestMemoryMmap, file: &File) -> Result<(), SnapErr> {
+pub fn write_memory(
+    mem: &GuestMemoryMmap,
+    shared: &[GuestAddress],
+    file: &File,
+) -> Result<(), SnapErr> {
     let mut offset = 0u64;
-    for region in mem.iter() {
+    for region in ram(mem, shared) {
         let len = region.len() as usize;
         let host = mem
             .get_host_address(region.start_addr())
@@ -362,9 +378,13 @@ fn is_zero(page: &[u8]) -> bool {
 
 /// Loads `memory.img` into freshly created guest RAM, copying only the image's
 /// data: its holes are zero, which the new RAM already is.
-pub fn read_memory(mem: &GuestMemoryMmap, path: &Path) -> Result<(), SnapErr> {
+pub fn read_memory(
+    mem: &GuestMemoryMmap,
+    shared: &[GuestAddress],
+    path: &Path,
+) -> Result<(), SnapErr> {
     let file = File::open(path)?;
-    let total: u64 = mem.iter().map(|r| r.len()).sum();
+    let total: u64 = ram(mem, shared).map(|r| r.len()).sum();
     if file.metadata()?.len() != total {
         return Err(SnapErr::State(format!(
             "memory image is {} bytes, guest memory {total}",
@@ -372,7 +392,7 @@ pub fn read_memory(mem: &GuestMemoryMmap, path: &Path) -> Result<(), SnapErr> {
         )));
     }
     let mut offset = 0u64;
-    for region in mem.iter() {
+    for region in ram(mem, shared) {
         let len = region.len();
         let host = mem
             .get_host_address(region.start_addr())
@@ -447,7 +467,7 @@ fn seek(file: &File, pos: u64, whence: i32) -> Result<Option<u64>, SnapErr> {
 mod tests {
     use super::*;
     use std::{env, process};
-    use vm_memory::{Bytes, GuestAddress};
+    use vm_memory::Bytes;
 
     #[test]
     fn vmstate_round_trips() {
@@ -530,7 +550,7 @@ mod tests {
             .unwrap();
         mem.write_slice(&[0xBB; 8], GuestAddress(0x20_0ff8))
             .unwrap();
-        write_memory(&mem, &File::create(&path).unwrap()).unwrap();
+        write_memory(&mem, &[], &File::create(&path).unwrap()).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), 0x20_0000);
 
         let back = GuestMemoryMmap::from_ranges(&layout).unwrap();
@@ -539,7 +559,7 @@ mod tests {
             .unwrap();
         back.write_slice(&[0xCC; 0x10], GuestAddress(0x20_0000))
             .unwrap();
-        read_memory(&back, &path).unwrap();
+        read_memory(&back, &[], &path).unwrap();
         for (addr, len) in layout {
             let mut a = vec![0; len];
             let mut b = vec![0; len];
