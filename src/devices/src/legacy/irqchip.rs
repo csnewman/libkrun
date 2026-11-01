@@ -49,6 +49,16 @@ impl IrqChipDevice {
     pub fn restore_state(&self, mpidrs: &[u64], state: &[u8]) -> Result<(), DeviceError> {
         self.inner.restore_state(mpidrs, state)
     }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_vcpu_state(&self, vcpuid: u64) -> Result<Vec<(u32, u64)>, DeviceError> {
+        self.inner.save_vcpu_state(vcpuid)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_vcpu_state(&self, vcpuid: u64, regs: &[(u32, u64)]) -> Result<(), DeviceError> {
+        self.inner.restore_vcpu_state(vcpuid, regs)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -168,6 +178,25 @@ pub trait IrqChipT: BusDevice + GICDevice {
         Err(DeviceError::Snapshot(
             "this interrupt controller can't be snapshotted".into(),
         ))
+    }
+
+    /// The state of a vCPU's CPU interface that [`IrqChipT::save_state`]
+    /// leaves out, for one that saves it on the vCPU's own thread. Called
+    /// there, with the vCPU paused.
+    fn save_vcpu_state(&self, _vcpuid: u64) -> Result<Vec<(u32, u64)>, DeviceError> {
+        Ok(Vec::new())
+    }
+
+    /// Loads what [`IrqChipT::save_vcpu_state`] saved, on the vCPU's thread,
+    /// after [`IrqChipT::restore_state`].
+    fn restore_vcpu_state(&self, _vcpuid: u64, regs: &[(u32, u64)]) -> Result<(), DeviceError> {
+        if regs.is_empty() {
+            Ok(())
+        } else {
+            Err(DeviceError::Snapshot(
+                "this interrupt controller has no vCPU state".into(),
+            ))
+        }
     }
 }
 
