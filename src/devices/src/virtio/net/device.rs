@@ -5,6 +5,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 use crate::Error as DeviceError;
+#[cfg(not(windows))]
+use crate::virtio::PauseError;
 use crate::virtio::net::Result;
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
@@ -15,6 +17,8 @@ use crate::virtio::{
 
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
+#[cfg(not(windows))]
+use super::worker::NetWorkerHandle;
 
 #[cfg(windows)]
 use super::unixstream::Unixstream;
@@ -95,6 +99,11 @@ pub struct Net {
     worker_socket: Option<OwnedSocket>,
     #[cfg(windows)]
     worker: Option<NetWorker>,
+    #[cfg(not(windows))]
+    worker: Option<NetWorkerHandle>,
+    // A worker stopped for a snapshot, which resumes as it was.
+    #[cfg(not(windows))]
+    paused_worker: Option<NetWorker>,
 }
 
 impl Net {
@@ -127,8 +136,9 @@ impl Net {
             config,
             #[cfg(windows)]
             worker_socket: None,
-            #[cfg(windows)]
             worker: None,
+            #[cfg(not(windows))]
+            paused_worker: None,
         })
     }
 
@@ -251,7 +261,7 @@ impl VirtioDevice for Net {
                 self.cfg_backend.clone(),
             ) {
                 Ok(worker) => {
-                    worker.run();
+                    self.worker = Some(worker.run());
                     self.device_state = DeviceState::Activated(mem, interrupt);
                     Ok(())
                 }
@@ -268,6 +278,37 @@ impl VirtioDevice for Net {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    #[cfg(not(windows))]
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        let worker = self
+            .worker
+            .take()
+            .ok_or_else(|| PauseError::Failed("virtio-net has no worker".into()))?
+            .stop()
+            .map_err(|e| PauseError::Failed(format!("virtio-net worker: {e:?}")))?;
+        let queues = worker.queues();
+        self.paused_worker = Some(worker);
+        Ok(queues)
+    }
+
+    /// Runs the worker stopped for a snapshot again, or on a device restored
+    /// from one, starts a worker on its new backend.
+    #[cfg(not(windows))]
+    fn resume(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        match self.paused_worker.take() {
+            Some(worker) => {
+                self.worker = Some(worker.run());
+                Ok(())
+            }
+            None => self.activate(mem, interrupt, queues),
+        }
     }
 
     fn reset(&mut self) -> bool {

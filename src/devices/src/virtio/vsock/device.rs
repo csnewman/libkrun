@@ -7,15 +7,16 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use utils::byte_order;
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
-    VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, PauseError, Queue as VirtQueue,
+    QueueConfig, VirtioDevice,
 };
 use super::TsiFlags;
 use super::muxer::VsockMuxer;
@@ -40,6 +41,10 @@ pub struct Vsock {
     pub(crate) muxer: VsockMuxer,
     pub(crate) queue_rx: Option<Arc<Mutex<VirtQueue>>>,
     pub(crate) queue_tx: Option<Arc<Mutex<VirtQueue>>>,
+    queue_ev: Option<VirtQueue>,
+    // Open (true) unless the device is paused for a snapshot: the muxer's
+    // threads and the proxies reach the queues themselves.
+    gate: Arc<AtomicBool>,
     // Queue events are stored separately for event handling.
     pub(crate) queue_events: Vec<Arc<EventFd>>,
     pub(crate) avail_features: u64,
@@ -61,6 +66,8 @@ impl Vsock {
             muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags),
             queue_rx: None,
             queue_tx: None,
+            queue_ev: None,
+            gate: Arc::new(AtomicBool::new(true)),
             queue_events: Vec::new(),
             avail_features: AVAIL_FEATURES,
             acked_features: 0,
@@ -259,10 +266,11 @@ impl VirtioDevice for Vsock {
 
         // Extract queues from DeviceQueues and wrap in Arc<Mutex<>>.
         let mut queues_vec: Vec<VirtQueue> = queues.into_iter().map(|dq| dq.queue).collect();
-        // Note: EVQ (index 2) is currently unused, we just take it to maintain the vec.
-        let _evq = queues_vec.pop().unwrap();
-        let tx_queue = queues_vec.pop().unwrap();
-        let rx_queue = queues_vec.pop().unwrap();
+        self.queue_ev = queues_vec.pop();
+        let mut tx_queue = queues_vec.pop().unwrap();
+        let mut rx_queue = queues_vec.pop().unwrap();
+        tx_queue.set_snapshot_gate(self.gate.clone());
+        rx_queue.set_snapshot_gate(self.gate.clone());
 
         self.queue_tx = Some(Arc::new(Mutex::new(tx_queue)));
         self.queue_rx = Some(Arc::new(Mutex::new(rx_queue)));
@@ -279,5 +287,59 @@ impl VirtioDevice for Vsock {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    /// Closes the queues to the muxer's threads, which keep what they would
+    /// have delivered until the device resumes.
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        let (Some(rx), Some(tx), Some(ev)) = (&self.queue_rx, &self.queue_tx, &self.queue_ev)
+        else {
+            return Err(PauseError::Failed("vsock queues are missing".into()));
+        };
+        self.gate.store(false, Ordering::Release);
+        // Taking each lock waits out a thread already delivering.
+        let rx = rx.lock().unwrap().copy();
+        let tx = tx.lock().unwrap().copy();
+        Ok([rx, tx, ev.copy()]
+            .into_iter()
+            .zip(self.queue_events.iter().cloned())
+            .map(|(queue, event)| DeviceQueue::new(queue, event))
+            .collect())
+    }
+
+    /// Opens the queues again after a snapshot. On a device restored from one,
+    /// whose peers' ends didn't survive, the guest is told the transport was
+    /// reset, which resets its connections.
+    fn resume(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        if self.device_state.is_activated() {
+            self.gate.store(true, Ordering::Release);
+            for index in [RXQ_INDEX, TXQ_INDEX] {
+                let _ = self.queue_events[index].write(1);
+            }
+            return Ok(());
+        }
+        self.activate(mem.clone(), interrupt.clone(), queues)?;
+        let Some(ev) = self.queue_ev.as_mut() else {
+            return Err(ActivateError::BadActivate);
+        };
+        match ev.pop(&mem) {
+            Some(head) if head.is_write_only() => {
+                let reset = uapi::VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.to_le_bytes();
+                if let Err(e) = mem.write_slice(&reset, head.addr) {
+                    error!("vsock: failed to write the transport reset event: {e:?}");
+                }
+                if let Err(e) = ev.add_used(&mem, head.index, reset.len() as u32) {
+                    error!("vsock: failed to queue the transport reset event: {e:?}");
+                }
+                interrupt.signal_used_queue();
+            }
+            _ => warn!("vsock: the guest has no event buffer for the transport reset"),
+        }
+        Ok(())
     }
 }
