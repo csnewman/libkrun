@@ -446,9 +446,10 @@ impl VirtioGpu {
     }
 
     /// The answer to a command that names a resource or context lost in a
-    /// restore. Releasing one is the guest agreeing it's gone, and succeeds;
-    /// any other use is refused, rather than deeper down where it would look
-    /// like the guest made the id up.
+    /// restore. Releasing one, detaching it from a context or unmapping it is
+    /// the guest agreeing it's gone, and succeeds; any other use is refused,
+    /// rather than deeper down where it would look like the guest made the id
+    /// up.
     pub fn lost_command(&mut self, ctx_id: u32, cmd: &GpuCommand) -> Option<VirtioGpuResult> {
         if self.lost.resources.is_empty()
             && self.lost.contexts.is_empty()
@@ -464,6 +465,13 @@ impl VirtioGpu {
             GpuCommand::ResourceUnref(info) if self.lost.resources.remove(&info.resource_id) => {
                 return Some(Ok(OkNoData));
             }
+            GpuCommand::CtxDetachResource(info)
+                if self.lost.contexts.contains(&ctx_id)
+                    || self.lost.resources.contains(&info.resource_id) =>
+            {
+                return Some(Ok(OkNoData));
+            }
+            GpuCommand::CtxAttachResource(info) => Some(info.resource_id),
             GpuCommand::ResourceUnref(info) => {
                 self.lost.stand_ins.remove(&info.resource_id);
                 Some(info.resource_id)
@@ -474,7 +482,8 @@ impl VirtioGpu {
                 return Some(Err(ErrUnspec));
             }
             GpuCommand::ResourceUnmapBlob(info)
-                if self.lost.stand_ins.contains(&info.resource_id) =>
+                if self.lost.stand_ins.contains(&info.resource_id)
+                    || self.lost.resources.contains(&info.resource_id) =>
             {
                 return Some(Ok(OkNoData));
             }
