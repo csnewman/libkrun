@@ -79,7 +79,7 @@ use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemoryMmap;
 
@@ -211,7 +211,7 @@ pub struct Vmm {
     pub(crate) vcpu_mpidrs: Vec<u64>,
     // Where the shared memory windows start, which a snapshot leaves to the
     // devices that map into them.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) shared_memory: Vec<GuestAddress>,
 }
 
