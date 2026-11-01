@@ -9,6 +9,7 @@ use vmm_sys_util::align_upwards;
 pub enum Error {
     #[cfg(feature = "gpu")]
     DuplicatedGpuRegion,
+    DuplicatedHotplugRegion,
     OutOfSpace,
 }
 
@@ -25,9 +26,14 @@ pub struct ShmManager {
     page_size: usize,
     fs_regions: BTreeMap<usize, ShmRegion>,
     gpu_region: Option<ShmRegion>,
+    hotplug_region: Option<ShmRegion>,
     #[cfg(feature = "vhost-user")]
     vhost_user_regions: BTreeMap<usize, ShmRegion>,
 }
+
+/// What a hotpluggable memory region's start and size are aligned to: Linux
+/// adds hotplugged memory 128 MiB at a time.
+const HOTPLUG_REGION_ALIGN: u64 = 128 << 20;
 
 impl ShmManager {
     pub fn new(info: &ArchMemoryInfo) -> ShmManager {
@@ -36,6 +42,7 @@ impl ShmManager {
             page_size: info.page_size,
             fs_regions: BTreeMap::new(),
             gpu_region: None,
+            hotplug_region: None,
             #[cfg(feature = "vhost-user")]
             vhost_user_regions: BTreeMap::new(),
         }
@@ -108,6 +115,24 @@ impl ShmManager {
     pub fn create_vhost_user_region(&mut self, index: usize, size: usize) -> Result<(), Error> {
         let region = self.create_region(size)?;
         self.vhost_user_regions.insert(index, region);
+        Ok(())
+    }
+
+    pub fn hotplug_region(&self) -> Option<&ShmRegion> {
+        self.hotplug_region.as_ref()
+    }
+
+    /// Reserves a region for memory the guest plugs in while it runs.
+    pub fn create_hotplug_region(&mut self, size: usize) -> Result<(), Error> {
+        if self.hotplug_region.is_some() {
+            return Err(Error::DuplicatedHotplugRegion);
+        }
+        self.next_guest_addr = self
+            .next_guest_addr
+            .checked_next_multiple_of(HOTPLUG_REGION_ALIGN)
+            .ok_or(Error::OutOfSpace)?;
+        let size = align_upwards!(size, HOTPLUG_REGION_ALIGN as usize);
+        self.hotplug_region = Some(self.create_region(size)?);
         Ok(())
     }
 

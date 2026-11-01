@@ -791,6 +791,7 @@ pub fn build_microvm(
     let gpu_shm_size = requirements.iter().filter_map(|r| r.gpu_shm).next();
     #[cfg(not(feature = "gpu"))]
     let gpu_shm_size: Option<usize> = None;
+    let hotplug_mem_sizes: Vec<usize> = requirements.iter().filter_map(|r| r.hotplug_mem).collect();
     let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
 
     #[cfg(feature = "tdx")]
@@ -826,6 +827,7 @@ pub fn build_microvm(
         vm_resources.firmware_config.as_ref(),
         &fs_shm_sizes,
         gpu_shm_size,
+        &hotplug_mem_sizes,
         use_vhost_user,
         &payload,
         #[cfg(feature = "tee")]
@@ -2010,6 +2012,7 @@ pub fn create_guest_memory(
     firmware_config: Option<&crate::vmm::vmm_config::firmware::FirmwareConfig>,
     fs_shm_sizes: &[Option<usize>],
     gpu_shm_size: Option<usize>,
+    hotplug_mem_sizes: &[usize],
     use_vhost_user: bool,
     payload: &Payload,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
@@ -2101,10 +2104,19 @@ pub fn create_guest_memory(
     #[cfg(not(feature = "gpu"))]
     let _ = gpu_shm_size;
 
+    for size in hotplug_mem_sizes {
+        shm_manager
+            .create_hotplug_region(*size)
+            .map_err(StartMicrovmError::ShmCreate)?;
+    }
+
     let _ = use_vhost_user;
 
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
+    if let Some(region) = shm_manager.hotplug_region() {
+        arch_mem_regions.push((region.guest_addr, region.size));
+    }
 
     let guest_mem = if use_vhost_user {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -2849,6 +2861,7 @@ pub mod tests {
             None,
             &[],
             None,
+            &[],
             false,
             &Payload::Empty,
             #[cfg(feature = "tee")]

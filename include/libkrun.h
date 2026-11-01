@@ -22,6 +22,8 @@ typedef void* KrunVmmHandle;
 typedef void* KrunBalloonDevice;
 typedef void* KrunRngDevice;
 typedef void* KrunRtcDevice;
+typedef void* KrunMemDevice;
+typedef void* KrunMemDeviceHandle;
 typedef void* KrunVsockDevice;
 typedef void* KrunBlockDevice;
 typedef void* KrunNetDevice;
@@ -30,7 +32,7 @@ typedef void* KrunVhostUserDevice;
 typedef void* KrunDisplayBackend;
 typedef void* KrunGpuDevice;
 typedef void* KrunInputDevice;
-typedef void* KrunAttachDevice; /* KrunRtcDevice | KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
+typedef void* KrunAttachDevice; /* KrunRtcDevice | KrunMemDevice | KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
 typedef void* KrunDeviceManager; /* KrunMmioDeviceManager | KrunPciDeviceManager */
 typedef void* KrunError; /* KrunVmmError | KrunVtableError */
 typedef void* KrunPushStr; /* KrunVtablePushStr */
@@ -38,7 +40,7 @@ typedef void* KrunPushStr; /* KrunVtablePushStr */
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
 
-typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunRtcDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
+typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunRtcDevice | KrunMemDevice | KrunMemDeviceHandle | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
 
 typedef uint64_t KrunResult;
 #define KRUN_RESULT_SUCCESS 0
@@ -560,6 +562,43 @@ KrunRtcDevice krun_rtc_device_new(KrunError* err_out);
 typedef KrunRtcDevice (*krun_rtc_device_new_fn)(KrunError* err_out);
 void krun_rtc_device_destroy(KrunRtcDevice handle);
 typedef void (*krun_rtc_device_destroy_fn)(KrunRtcDevice handle);
+
+/* MemDevice --------------------------------------------------------- */
+
+/**
+ * A device that can give the guest up to `region_mib` MiB of memory on
+ * top of its RAM, rounded up to a multiple of 128 MiB. The guest starts
+ * with none of it.
+ */
+KrunMemDevice krun_mem_device_new(uint32_t region_mib, KrunError* err_out);
+typedef KrunMemDevice (*krun_mem_device_new_fn)(uint32_t region_mib, KrunError* err_out);
+/**
+ * A handle for resizing the guest's memory while the VM runs. Take it
+ * before adding the device, which consumes it.
+ */
+KrunMemDeviceHandle krun_mem_device_handle(KrunMemDevice handle);
+typedef KrunMemDeviceHandle (*krun_mem_device_handle_fn)(KrunMemDevice handle);
+void krun_mem_device_destroy(KrunMemDevice handle);
+typedef void (*krun_mem_device_destroy_fn)(KrunMemDevice handle);
+
+/* MemDeviceHandle --------------------------------------------------- */
+
+/**
+ * Asks the guest to plug in or unplug memory until it has `mib` MiB of
+ * the region. `mib` must be a multiple of 2 MiB and no more than the
+ * region. The guest does this in its own time, and may not manage to
+ * unplug all that's asked of it.
+ */
+KrunResult krun_mem_device_handle_set_requested_mib(KrunMemDeviceHandle handle, uint32_t mib, KrunError* err_out);
+typedef KrunResult (*krun_mem_device_handle_set_requested_mib_fn)(KrunMemDeviceHandle handle, uint32_t mib, KrunError* err_out);
+/** How much of the region the guest has been asked to have, in MiB. */
+uint32_t krun_mem_device_handle_requested_mib(KrunMemDeviceHandle handle);
+typedef uint32_t (*krun_mem_device_handle_requested_mib_fn)(KrunMemDeviceHandle handle);
+/** How much of the region the guest has plugged in, in MiB. */
+uint32_t krun_mem_device_handle_plugged_mib(KrunMemDeviceHandle handle);
+typedef uint32_t (*krun_mem_device_handle_plugged_mib_fn)(KrunMemDeviceHandle handle);
+void krun_mem_device_handle_destroy(KrunMemDeviceHandle handle);
+typedef void (*krun_mem_device_handle_destroy_fn)(KrunMemDeviceHandle handle);
 
 /* VsockDevice ------------------------------------------------------- */
 
