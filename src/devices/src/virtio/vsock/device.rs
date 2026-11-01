@@ -51,6 +51,9 @@ pub struct Vsock {
     pub(crate) acked_features: u64,
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
+    // Set once the device has been reset, after which it isn't activated
+    // again: the muxer's threads can't be started over.
+    was_reset: bool,
 }
 
 impl Vsock {
@@ -74,6 +77,7 @@ impl Vsock {
             activate_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK)
                 .map_err(super::VsockError::EventFd)?,
             device_state: DeviceState::Inactive,
+            was_reset: false,
         })
     }
 
@@ -256,6 +260,11 @@ impl VirtioDevice for Vsock {
             return Err(ActivateError::BadActivate);
         }
 
+        if self.was_reset {
+            error!("vsock can't be activated again after a reset");
+            return Err(ActivateError::BadActivate);
+        }
+
         if self.activate_evt.write(1).is_err() {
             error!("Cannot write to activate_evt",);
             return Err(ActivateError::BadActivate);
@@ -287,6 +296,24 @@ impl VirtioDevice for Vsock {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    /// Closes the queues to the muxer's threads, as a pause does, and lets go
+    /// of them. Linux resets every device as it shuts down.
+    fn reset(&mut self) -> bool {
+        self.gate.store(false, Ordering::Release);
+        // Taking each lock waits out a thread already delivering.
+        for queue in [self.queue_rx.take(), self.queue_tx.take()]
+            .into_iter()
+            .flatten()
+        {
+            drop(queue.lock().unwrap());
+        }
+        self.queue_ev = None;
+        self.acked_features = 0;
+        self.device_state = DeviceState::Inactive;
+        self.was_reset = true;
+        true
     }
 
     /// Closes the queues to the muxer's threads, which keep what they would

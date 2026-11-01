@@ -61,10 +61,18 @@ impl NetWorker {
         tx_q: DeviceQueue,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
-        _vnet_features: u64,
+        vnet_features: u64,
         cfg_backend: VirtioNetBackend,
     ) -> Result<Self, ConnectError> {
-        let backend = match cfg_backend {
+        let backend = Self::connect(vnet_features, cfg_backend)?;
+        Self::with_backend(rx_q, tx_q, interrupt, mem, backend)
+    }
+
+    fn connect(
+        _vnet_features: u64,
+        cfg_backend: VirtioNetBackend,
+    ) -> Result<Box<dyn NetBackend + Send>, ConnectError> {
+        Ok(match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
                 // SAFETY: we need to trust that the library user has configured
                 // the backend with a healthy file descriptor.
@@ -87,8 +95,17 @@ impl NetWorker {
             VirtioNetBackend::Tap(tap_name) => {
                 Box::new(Tap::new(tap_name, _vnet_features)?) as Box<dyn NetBackend + Send>
             }
-        };
+        })
+    }
 
+    /// A worker on a backend already connected, which a reset worker left.
+    pub fn with_backend(
+        rx_q: DeviceQueue,
+        tx_q: DeviceQueue,
+        interrupt: InterruptTransport,
+        mem: GuestMemoryMmap,
+        backend: Box<dyn NetBackend + Send>,
+    ) -> Result<Self, ConnectError> {
         Ok(Self {
             rx_q,
             tx_q,
@@ -119,6 +136,11 @@ impl NetWorker {
             .spawn(|| self.work())
             .unwrap();
         NetWorkerHandle { stop, thread }
+    }
+
+    /// The worker's backend, for a worker the device starts after a reset.
+    pub fn into_backend(self) -> Box<dyn NetBackend + Send> {
+        self.backend
     }
 
     /// The worker's queues, copied, for a snapshot.
