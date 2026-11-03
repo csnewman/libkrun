@@ -34,6 +34,7 @@ pub struct VmmBuilder<'a> {
     kernel_console: Option<String>,
     nested_virt: bool,
     split_irqchip: bool,
+    transparent_huge_pages: bool,
     acpi: bool,
     smbios_oem_strings: Vec<String>,
     shutdown_support: bool,
@@ -113,6 +114,18 @@ impl<'a> VmmBuilder<'a> {
             return Err(VmmError::InvalidParam());
         }
         self.split_irqchip = enabled;
+        Ok(self)
+    }
+
+    /// Ask for transparent huge pages for guest memory.
+    ///
+    /// Advises `MADV_HUGEPAGE` on guest memory, so a host with THP set to
+    /// `madvise` backs it with huge pages. Only supported on Linux.
+    pub fn transparent_huge_pages(mut self, enabled: bool) -> Result<Self, VmmError> {
+        if enabled && !cfg!(target_os = "linux") {
+            return Err(VmmError::InvalidParam());
+        }
+        self.transparent_huge_pages = enabled;
         Ok(self)
     }
 
@@ -456,6 +469,12 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
 
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
+    #[cfg(target_os = "linux")]
+    {
+        vm_resources.transparent_huge_pages = builder_cfg.transparent_huge_pages;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = builder_cfg.transparent_huge_pages;
     vm_resources.acpi_enabled = builder_cfg.acpi;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {

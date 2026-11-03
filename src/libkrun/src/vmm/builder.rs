@@ -830,6 +830,8 @@ pub fn build_microvm(
         &hotplug_mem_sizes,
         use_vhost_user,
         &payload,
+        #[cfg(target_os = "linux")]
+        vm_resources.transparent_huge_pages,
         #[cfg(feature = "tee")]
         fw_range_for_mem,
     )?;
@@ -2034,6 +2036,7 @@ pub fn create_guest_memory(
     hotplug_mem_sizes: &[usize],
     use_vhost_user: bool,
     payload: &Payload,
+    #[cfg(target_os = "linux")] transparent_huge_pages: bool,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
 ) -> std::result::Result<
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
@@ -2195,15 +2198,23 @@ pub fn create_guest_memory(
     };
 
     #[cfg(target_os = "linux")]
-    for region in guest_mem.iter() {
-        // SAFETY: the range is the region's own mapping, and the advice keeps its contents.
-        unsafe {
-            libc::madvise(
-                region.as_ptr().cast(),
-                region.len() as usize,
-                libc::MADV_HUGEPAGE,
-            )
-        };
+    if transparent_huge_pages {
+        for region in guest_mem.iter() {
+            // SAFETY: the range is the region's own mapping, and the advice keeps its contents.
+            let ret = unsafe {
+                libc::madvise(
+                    region.as_ptr().cast(),
+                    region.len() as usize,
+                    libc::MADV_HUGEPAGE,
+                )
+            };
+            if ret != 0 {
+                warn!(
+                    "Failed to enable transparent huge pages for guest memory: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
     }
 
     let LoadedPayload {
@@ -2999,9 +3010,35 @@ pub mod tests {
             &[],
             false,
             &Payload::Empty,
+            #[cfg(target_os = "linux")]
+            false,
             #[cfg(feature = "tee")]
             None,
         )
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    fn test_create_guest_memory_advises_huge_pages_only_when_asked() {
+        for thp in [true, false] {
+            let (guest_memory, _info, _shm_manager, _payload_config) =
+                create_guest_memory(64, None, None, &[], None, &[], false, &Payload::Empty, thp)
+                    .unwrap();
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            for region in guest_memory.iter() {
+                let start = format!("{:x}-", region.as_ptr() as usize);
+                let flags = smaps
+                    .split_inclusive('\n')
+                    .skip_while(|line| !line.starts_with(&start))
+                    .find_map(|line| line.strip_prefix("VmFlags:"))
+                    .unwrap();
+                assert_eq!(
+                    flags.split_whitespace().any(|flag| flag == "hg"),
+                    thp,
+                    "{thp}, {start}"
+                );
+            }
+        }
     }
 
     #[test]
