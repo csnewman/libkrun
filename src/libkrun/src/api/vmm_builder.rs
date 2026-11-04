@@ -121,7 +121,8 @@ impl<'a> VmmBuilder<'a> {
     ///
     /// Advises `MADV_HUGEPAGE` on guest memory, so a host with THP set to
     /// `madvise` backs it with huge pages. Building the VM fails if the host
-    /// kernel has no transparent huge pages. Only supported on Linux.
+    /// kernel is built without transparent huge page support. Only supported
+    /// on Linux.
     pub fn transparent_huge_pages(mut self, enabled: bool) -> Result<Self, VmmError> {
         if enabled && !cfg!(target_os = "linux") {
             return Err(VmmError::InvalidParam());

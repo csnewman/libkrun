@@ -1572,7 +1572,8 @@
             "",
             " Advises `MADV_HUGEPAGE` on guest memory, so a host with THP set to",
             " `madvise` backs it with huge pages. Building the VM fails if the host",
-            " kernel has no transparent huge pages. Only supported on Linux."
+            " kernel is built without transparent huge page support. Only supported",
+            " on Linux."
           ],
           "receiver": "value",
           "params": [

@@ -455,7 +455,8 @@ typedef KrunResult (*krun_vmm_builder_split_irqchip_fn)(KrunVmmBuilder* handle, 
  *
  * Advises `MADV_HUGEPAGE` on guest memory, so a host with THP set to
  * `madvise` backs it with huge pages. Building the VM fails if the host
- * kernel has no transparent huge pages. Only supported on Linux.
+ * kernel is built without transparent huge page support. Only supported
+ * on Linux.
  */
 KrunResult krun_vmm_builder_transparent_huge_pages(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_transparent_huge_pages_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
