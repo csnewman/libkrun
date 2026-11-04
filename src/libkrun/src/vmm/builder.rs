@@ -2209,7 +2209,7 @@ pub fn create_guest_memory(
                 )
             };
             if ret != 0 {
-                warn!(
+                error!(
                     "Failed to enable transparent huge pages for guest memory: {}",
                     io::Error::last_os_error()
                 );
