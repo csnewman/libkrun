@@ -2209,10 +2209,10 @@ pub fn create_guest_memory(
                 )
             };
             if ret != 0 {
-                error!(
-                    "Failed to enable transparent huge pages for guest memory: {}",
+                return Err(StartMicrovmError::GuestMemoryMmap(format!(
+                    "failed to enable transparent huge pages: {}",
                     io::Error::last_os_error()
-                );
+                )));
             }
         }
     }
