@@ -6,6 +6,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
+#[cfg(target_os = "macos")]
+use utils::worker_message::WorkerMessage;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::defs::{self, uapi::*};
@@ -76,8 +78,12 @@ pub struct Mem {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
     pub(crate) config: VirtioMemConfig,
+    // macOS gives unplugged memory back by its guest address.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     host_addr: usize,
     plugged: Vec<bool>,
+    #[cfg(target_os = "macos")]
+    map_sender: Option<crossbeam_channel::Sender<WorkerMessage>>,
 }
 
 impl Mem {
@@ -105,6 +111,8 @@ impl Mem {
             },
             host_addr: 0,
             plugged: vec![false; (region_size / BLOCK_SIZE) as usize],
+            #[cfg(target_os = "macos")]
+            map_sender: None,
         })
     }
 
@@ -121,6 +129,14 @@ impl Mem {
     pub fn set_region(&mut self, guest_addr: u64, host_addr: usize) {
         self.config.addr = guest_addr;
         self.host_addr = host_addr;
+    }
+
+    /// Sets the channel to the VMM worker, which gives unplugged memory back
+    /// to the host: Hypervisor.framework keeps the pages it maps into the
+    /// guest, which madvise() can't free.
+    #[cfg(target_os = "macos")]
+    pub fn set_map_sender(&mut self, map_sender: crossbeam_channel::Sender<WorkerMessage>) {
+        self.map_sender = Some(map_sender);
     }
 
     pub fn requested_size(&self) -> u64 {
@@ -162,6 +178,7 @@ impl Mem {
         Some(first..first + nb_blocks as usize)
     }
 
+    #[cfg(target_os = "linux")]
     fn discard(&self, blocks: Range<usize>) -> io::Result<()> {
         let offset = blocks.start as u64 * BLOCK_SIZE;
         let len = blocks.len() as u64 * BLOCK_SIZE;
@@ -183,6 +200,27 @@ impl Mem {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Has the VMM replace the blocks' pages with fresh memory, which gives
+    /// them back to the host, and waits for it: the guest may plug them again
+    /// as soon as the unplug is answered.
+    #[cfg(target_os = "macos")]
+    fn discard(&self, blocks: Range<usize>) -> io::Result<()> {
+        let Some(map_sender) = &self.map_sender else {
+            return Err(io::Error::other("no channel to the VMM"));
+        };
+        let addr = self.config.addr + blocks.start as u64 * BLOCK_SIZE;
+        let len = blocks.len() as u64 * BLOCK_SIZE;
+        let (reply_sender, reply) = crossbeam_channel::bounded(1);
+        map_sender
+            .send(WorkerMessage::ReclaimMemory(reply_sender, addr, len))
+            .map_err(|_| io::Error::other("the VMM has stopped"))?;
+        match reply.recv() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(io::Error::other("the VMM didn't replace the pages")),
+            Err(_) => Err(io::Error::other("the VMM has stopped")),
+        }
     }
 
     fn plug(&mut self, addr: u64, nb_blocks: u16) -> u16 {
