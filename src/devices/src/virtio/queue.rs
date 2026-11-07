@@ -768,6 +768,51 @@ impl Queue {
     }
 }
 
+impl Queue {
+    /// Capture the queue's runtime state for snapshot. `max_size` is omitted —
+    /// it's fixed at construction from the device config.
+    pub fn snapshot(&self) -> QueueSnapshot {
+        QueueSnapshot {
+            size: self.size,
+            ready: self.ready,
+            desc_table: self.desc_table.raw_value(),
+            avail_ring: self.avail_ring.raw_value(),
+            used_ring: self.used_ring.raw_value(),
+            next_avail: self.next_avail.0,
+            next_used: self.next_used.0,
+            event_idx_enabled: self.event_idx_enabled,
+            num_added: self.num_added.0,
+        }
+    }
+
+    /// Restore runtime state captured by [`Queue::snapshot`].
+    pub fn restore(&mut self, s: &QueueSnapshot) {
+        self.size = s.size;
+        self.ready = s.ready;
+        self.desc_table = GuestAddress(s.desc_table);
+        self.avail_ring = GuestAddress(s.avail_ring);
+        self.used_ring = GuestAddress(s.used_ring);
+        self.next_avail = Wrapping(s.next_avail);
+        self.next_used = Wrapping(s.next_used);
+        self.event_idx_enabled = s.event_idx_enabled;
+        self.num_added = Wrapping(s.num_added);
+    }
+}
+
+/// Serializable virtqueue runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
+pub struct QueueSnapshot {
+    pub size: u16,
+    pub ready: bool,
+    pub desc_table: u64,
+    pub avail_ring: u64,
+    pub used_ring: u64,
+    pub next_avail: u16,
+    pub next_used: u16,
+    pub event_idx_enabled: bool,
+    pub num_added: u16,
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::marker::PhantomData;
@@ -793,6 +838,27 @@ pub(crate) mod tests {
         assert!(!queue.enable_notification(&mem).unwrap());
         assert!(queue.disable_notification(&mem).is_ok());
         assert!(!queue.needs_notification(&mem).unwrap());
+    }
+
+    #[test]
+    fn queue_snapshot_round_trips() {
+        let s = QueueSnapshot {
+            size: 256,
+            ready: true,
+            desc_table: 0x1000,
+            avail_ring: 0x2000,
+            used_ring: 0x3000,
+            next_avail: 5,
+            next_used: 7,
+            event_idx_enabled: true,
+            num_added: 3,
+        };
+        let cfg = bincode::config::standard();
+        let b = bincode::encode_to_vec(s, cfg).unwrap();
+        let (back, _): (QueueSnapshot, _) = bincode::decode_from_slice(&b, cfg).unwrap();
+        assert_eq!(back, s);
+        // Truncated input is rejected, not mis-decoded.
+        assert!(bincode::decode_from_slice::<QueueSnapshot, _>(&b[..b.len() - 1], cfg).is_err());
     }
 
     // Represents a location in GuestMemoryMmap which holds a given type.
