@@ -427,14 +427,16 @@ impl BlockWorker {
         }
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    /// Runs the worker on a thread of its own, which returns the queue when
+    /// the worker is stopped.
+    pub fn run(self) -> thread::JoinHandle<DeviceQueue> {
         thread::Builder::new()
             .name("block worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> DeviceQueue {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
         #[cfg(target_os = "linux")]
@@ -532,7 +534,7 @@ impl BlockWorker {
                                 if let Some(pool) = pool.as_mut() {
                                     self.drain_pool(pool);
                                 }
-                                return;
+                                return self.device_queue;
                             }
                             _ => {
                                 log::warn!(
