@@ -61,6 +61,8 @@ pub use device_builders::{ConsoleBuilder, ConsoleDevice};
 pub use device_builders::{DisplayBackend, DisplayInfoBuilder};
 #[cfg(feature = "gpu")]
 pub use device_builders::{GpuDevice, VirglRendererFlags};
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+pub use device_builders::{MemDevice, MemDeviceHandle};
 #[cfg(not(feature = "tee"))]
 pub use devices::virtio::balloon::FreePageReportingMode;
 #[cfg(feature = "blk")]
@@ -107,6 +109,12 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::device_builders::RtcDevice = 27,
     #[cfg(target_os = "linux")]
     crate::api::device_builders::AttachDevice for crate::api::device_builders::RtcDevice,
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    crate::api::device_builders::MemDevice = 28,
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    crate::api::device_builders::MemDeviceHandle = 29,
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    crate::api::device_builders::AttachDevice for crate::api::device_builders::MemDevice,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     crate::api::device_builders::AttachDevice for crate::api::device_builders::FsDevice,
     crate::api::device_builders::AttachDevice for crate::api::device_builders::ConsoleDevice,
