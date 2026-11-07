@@ -121,6 +121,7 @@ pub enum Error {
     VcpuReadRegister,
     VcpuReadSystemRegister,
     VcpuRequestExit,
+    RestoreState,
     VcpuRun,
     VcpuSetPendingIrq,
     VcpuSetRegister,
@@ -154,6 +155,7 @@ impl Display for Error {
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
             VcpuReadSystemRegister => write!(f, "Error reading HVF vCPU system register"),
             VcpuRequestExit => write!(f, "Error requesting HVF vCPU exit"),
+            RestoreState => write!(f, "The snapshot's vCPU registers aren't HVF's"),
             VcpuRun => write!(f, "Error running HVF vCPU"),
             VcpuSetPendingIrq => write!(f, "Error setting HVF vCPU pending irq"),
             VcpuSetRegister => write!(f, "Error setting HVF vCPU register"),
@@ -364,6 +366,109 @@ struct MmioRead {
     addr: u64,
     len: usize,
     srt: u32,
+}
+
+/// The general registers a snapshot saves, in the order of
+/// [`HvfVcpuState::gp`]. The stack pointers are system registers.
+#[cfg(target_arch = "aarch64")]
+const SAVED_GP: [hv_reg_t; 33] = [
+    hv_reg_t_HV_REG_X0,
+    hv_reg_t_HV_REG_X1,
+    hv_reg_t_HV_REG_X2,
+    hv_reg_t_HV_REG_X3,
+    hv_reg_t_HV_REG_X4,
+    hv_reg_t_HV_REG_X5,
+    hv_reg_t_HV_REG_X6,
+    hv_reg_t_HV_REG_X7,
+    hv_reg_t_HV_REG_X8,
+    hv_reg_t_HV_REG_X9,
+    hv_reg_t_HV_REG_X10,
+    hv_reg_t_HV_REG_X11,
+    hv_reg_t_HV_REG_X12,
+    hv_reg_t_HV_REG_X13,
+    hv_reg_t_HV_REG_X14,
+    hv_reg_t_HV_REG_X15,
+    hv_reg_t_HV_REG_X16,
+    hv_reg_t_HV_REG_X17,
+    hv_reg_t_HV_REG_X18,
+    hv_reg_t_HV_REG_X19,
+    hv_reg_t_HV_REG_X20,
+    hv_reg_t_HV_REG_X21,
+    hv_reg_t_HV_REG_X22,
+    hv_reg_t_HV_REG_X23,
+    hv_reg_t_HV_REG_X24,
+    hv_reg_t_HV_REG_X25,
+    hv_reg_t_HV_REG_X26,
+    hv_reg_t_HV_REG_X27,
+    hv_reg_t_HV_REG_X28,
+    hv_reg_t_HV_REG_X29,
+    hv_reg_t_HV_REG_X30,
+    hv_reg_t_HV_REG_PC,
+    hv_reg_t_HV_REG_CPSR,
+];
+
+/// The EL1 and timer system registers a snapshot saves. MPIDR_EL1 is set as
+/// the vCPU is created. The pointer authentication keys are among them: the
+/// kernel signs return addresses with them, and a vCPU with other keys faults
+/// on returning.
+#[cfg(target_arch = "aarch64")]
+const SAVED_SYSREGS: [hv_sys_reg_t; 38] = [
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AMAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL0,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ESR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CONTEXTIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL0,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDRRO_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CPACR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CSSELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_PAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTKCTL_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_CVAL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYHI_EL1,
+];
+
+/// A vCPU's registers, saved for a snapshot by [`HvfVcpu::save_state`]. The
+/// GIC's CPU interface registers are saved with the GIC.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HvfVcpuState {
+    /// One value for each of [`SAVED_GP`], in order.
+    pub gp: Vec<u64>,
+    /// Each of [`SAVED_SYSREGS`] with its value.
+    pub sysregs: Vec<(u16, u64)>,
+    /// Q0 to Q31.
+    pub simd: Vec<u128>,
+    pub fpcr: u64,
+    pub fpsr: u64,
+    pub vtimer_masked: bool,
+    /// The guest's virtual counter when the VM was paused.
+    pub counter: u64,
 }
 
 pub struct HvfVcpu<'a> {
@@ -614,6 +719,80 @@ impl HvfVcpu<'_> {
         Ok(())
     }
 
+    /// Saves the vCPU's registers for a snapshot, on the vCPU's thread while
+    /// it is paused. `paused_at` is the host's counter when the VM was paused,
+    /// which gives the guest's.
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_state(&mut self, paused_at: u64) -> Result<HvfVcpuState, Error> {
+        self.complete_exit()?;
+        let gp = SAVED_GP
+            .iter()
+            .map(|&r| self.read_reg(r))
+            .collect::<Result<_, _>>()?;
+        let sysregs = SAVED_SYSREGS
+            .iter()
+            .map(|&r| Ok((r, self.read_sys_reg(r)?)))
+            .collect::<Result<_, Error>>()?;
+        let simd = (0..32)
+            .map(|q| {
+                let mut val: hv_simd_fp_uchar16_t = 0;
+                match unsafe { hv_vcpu_get_simd_fp_reg(self.vcpuid, q, &mut val) } {
+                    HV_SUCCESS => Ok(val),
+                    _ => Err(Error::VcpuReadRegister),
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(HvfVcpuState {
+            gp,
+            sysregs,
+            simd,
+            fpcr: self.read_reg(hv_reg_t_HV_REG_FPCR)?,
+            fpsr: self.read_reg(hv_reg_t_HV_REG_FPSR)?,
+            vtimer_masked: self.vtimer_masked,
+            counter: paused_at.wrapping_sub(self.vtimer_offset.get()),
+        })
+    }
+
+    /// Loads what [`HvfVcpu::save_state`] saved into a vCPU that hasn't run,
+    /// on its thread. `vtimer_offset` puts the guest's counter where it was;
+    /// every vCPU of the VM is given the same.
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_state(&mut self, state: &HvfVcpuState, vtimer_offset: u64) -> Result<(), Error> {
+        if state.gp.len() != SAVED_GP.len()
+            || state.simd.len() != 32
+            || state.sysregs.len() != SAVED_SYSREGS.len()
+        {
+            return Err(Error::RestoreState);
+        }
+        for (&r, &v) in SAVED_GP.iter().zip(&state.gp) {
+            self.write_reg(r, v)?;
+        }
+        // A snapshot is the guest's to write, so it may set only the
+        // registers a snapshot saves.
+        for &(r, v) in &state.sysregs {
+            if !SAVED_SYSREGS.contains(&r) {
+                return Err(Error::RestoreState);
+            }
+            if unsafe { hv_vcpu_set_sys_reg(self.vcpuid, r, v) } != HV_SUCCESS {
+                return Err(Error::VcpuSetSystemRegister(r, v));
+            }
+        }
+        for (q, &val) in state.simd.iter().enumerate() {
+            if unsafe { hv_vcpu_set_simd_fp_reg(self.vcpuid, q as u32, val) } != HV_SUCCESS {
+                return Err(Error::VcpuSetRegister);
+            }
+        }
+        self.write_reg(hv_reg_t_HV_REG_FPCR, state.fpcr)?;
+        self.write_reg(hv_reg_t_HV_REG_FPSR, state.fpsr)?;
+        if unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, vtimer_offset) } != HV_SUCCESS {
+            return Err(Error::VcpuSetRegister);
+        }
+        self.vtimer_offset.set(vtimer_offset);
+        vcpu_set_vtimer_mask(self.vcpuid, state.vtimer_masked)?;
+        self.vtimer_masked = state.vtimer_masked;
+        Ok(())
+    }
+
     fn hvf_sync_vtimer(&mut self, vcpu_list: Arc<dyn Vcpus>) {
         if !self.vtimer_masked {
             return;
@@ -658,9 +837,11 @@ impl HvfVcpu<'_> {
         }
     }
 
-    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
-        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
-
+    /// Finishes the instruction the last exit stopped at: writes what an MMIO
+    /// read read into its register, and steps over an emulated instruction.
+    /// A snapshot finishes it too, so a restored vCPU doesn't repeat the
+    /// access.
+    fn complete_exit(&mut self) -> Result<(), Error> {
         if let Some(mmio_read) = self.pending_mmio_read.take()
             && mmio_read.srt < 31
         {
@@ -683,6 +864,14 @@ impl HvfVcpu<'_> {
             self.write_reg(hv_reg_t_HV_REG_PC, pc + 4)?;
             self.pending_advance_pc = false;
         }
+
+        Ok(())
+    }
+
+    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
+        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
+
+        self.complete_exit()?;
 
         if pending_irq {
             vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;

@@ -24,7 +24,7 @@ use std::os::fd::{AsFd, BorrowedFd, FromRawFd};
 use std::os::windows::io::AsHandle;
 #[cfg(windows)]
 use std::os::windows::io::BorrowedHandle;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::Path;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
@@ -1338,6 +1338,9 @@ pub fn build_microvm(
             vm_resources.nested_enabled,
         )
         .map_err(StartMicrovmError::Internal)?;
+        for vcpu in vcpus.iter_mut() {
+            vcpu.set_intc(intc.clone());
+        }
 
         attach_legacy_devices(
             &vm,
@@ -1418,9 +1421,9 @@ pub fn build_microvm(
             any(target_arch = "aarch64", target_arch = "riscv64")
         ))]
         paused_counter: None,
-        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
         intc: intc.clone(),
-        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
         vcpu_mpidrs: Vec::new(),
         #[cfg(target_os = "linux")]
         shared_memory: _shm_manager
@@ -1590,9 +1593,21 @@ pub fn build_microvm(
     if let Some(dir) = &vm_resources.restore_from {
         restore_snapshot(&vmm, &mut vcpus, dir).map_err(StartMicrovmError::Restore)?;
     }
+    #[cfg(target_os = "macos")]
+    let snapshot = match &vm_resources.restore_from {
+        Some(dir) => {
+            Some(restore_snapshot(&vmm, &mut vcpus, dir).map_err(StartMicrovmError::Restore)?)
+        }
+        None => None,
+    };
 
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
+
+    #[cfg(target_os = "macos")]
+    if let Some(snapshot) = snapshot {
+        restore_vcpus(&mut vmm, snapshot).map_err(StartMicrovmError::Restore)?;
+    }
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
@@ -2731,6 +2746,122 @@ fn restore_snapshot(vmm: &Vmm, vcpus: &mut [Vcpu], dir: &Path) -> std::result::R
             .map_err(|e| format!("device {id}: {e}"))?;
     }
     Ok(())
+}
+
+/// Loads a snapshot's guest memory and devices into a VM built as the one it
+/// was taken of, in place of its boot, and has its vCPUs wait for theirs:
+/// HVF loads a vCPU's state, and the interrupt controller's, only on the
+/// vCPU's own thread. [`restore_vcpus`] gives it to them once they start.
+#[cfg(target_os = "macos")]
+fn restore_snapshot(
+    vmm: &Vmm,
+    vcpus: &mut [Vcpu],
+    dir: &Path,
+) -> std::result::Result<super::snapshot::Snapshot, String> {
+    use super::snapshot::{Snapshot, read_memory};
+    use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
+
+    let snap = Snapshot::read(dir).map_err(|e| e.to_string())?;
+    let devices = vmm.snapshottables()?;
+    let ids: Vec<String> = devices.iter().map(|(id, _)| id.clone()).collect();
+    let mem_bytes: u64 = vmm.guest_memory.iter().map(|r| r.len()).sum();
+    snap.manifest
+        .validate((mem_bytes >> 20) as usize, vcpus.len() as u8, &ids)
+        .map_err(|e| e.to_string())?;
+    if snap.vcpus.len() != vcpus.len() || snap.devices.len() != devices.len() {
+        return Err("the snapshot's sections don't match its manifest".into());
+    }
+
+    read_memory(&vmm.guest_memory, &snap.memory).map_err(|e| e.to_string())?;
+
+    for ((id, device), (saved_id, state)) in devices.iter().zip(&snap.devices) {
+        if id != saved_id {
+            return Err(format!("snapshot device {saved_id} is {id} in this VM"));
+        }
+        device
+            .lock()
+            .unwrap()
+            .restore(state)
+            .map_err(|e| format!("device {id}: {e}"))?;
+    }
+    for vcpu in vcpus.iter_mut() {
+        vcpu.set_restoring();
+    }
+    Ok(snap)
+}
+
+/// Gives the started vCPUs their state from the snapshot, the first the
+/// interrupt controller's too. The VM stays paused for [`resume_restored`].
+#[cfg(target_os = "macos")]
+fn restore_vcpus(
+    vmm: &mut Vmm,
+    snap: super::snapshot::Snapshot,
+) -> std::result::Result<(), String> {
+    use super::vstate::{
+        VCPU_SNAPSHOT_VERSION, VcpuEvent, VcpuResponse, VcpuRestore, snapshot_counter,
+    };
+
+    let Some((version, irqchip)) = &snap.irqchip else {
+        return Err("the snapshot has no interrupt controller state".into());
+    };
+    if *version != super::IRQCHIP_SNAPSHOT_VERSION {
+        return Err(format!(
+            "unsupported interrupt controller state version {version}"
+        ));
+    }
+    let ((gic, its), _): ((Vec<u8>, Option<Vec<u8>>), _) =
+        bincode::decode_from_slice(irqchip, bincode::config::standard())
+            .map_err(|e| format!("interrupt controller state: {e}"))?;
+    if its.is_some() {
+        return Err("the snapshot has an ITS, this VM doesn't".into());
+    }
+
+    // The vCPUs stopped moments apart; they resume at the latest of their
+    // counters, so it is the same on every vCPU and never goes back.
+    let mut counter = 0;
+    for (version, state) in &snap.vcpus {
+        if *version != VCPU_SNAPSHOT_VERSION {
+            return Err(format!("unsupported vcpu state version {version}"));
+        }
+        counter = counter.max(snapshot_counter(state)?);
+    }
+    let now = unsafe { hvf::mach_absolute_time() };
+    let vtimer_offset = now.wrapping_sub(counter);
+    let mut irqchip = Some(gic);
+    for (handle, (_, state)) in vmm.vcpus_handles.iter().zip(snap.vcpus) {
+        let restore = VcpuRestore {
+            state,
+            irqchip: irqchip.take(),
+            vtimer_offset,
+        };
+        handle
+            .send_event(VcpuEvent::Restore(Box::new(restore)))
+            .map_err(|e| format!("vcpu restore event: {e:?}"))?;
+        match handle.response_receiver().recv() {
+            Ok(VcpuResponse::Restored(result)) => result.map_err(|e| format!("vcpu: {e}"))?,
+            Ok(other) => return Err(format!("unexpected vcpu response: {other:?}")),
+            Err(e) => return Err(format!("vcpu response: {e:?}")),
+        }
+    }
+    vmm.paused = true;
+    vmm.paused_at = now;
+    Ok(())
+}
+
+/// Starts a restored VM's devices' workers, and resumes it. Runs once the
+/// VMM worker has started, and outside the VMM's lock: a device may map
+/// memory into the guest as it resumes, which the VMM worker does.
+#[cfg(target_os = "macos")]
+pub fn resume_restored(vmm: &Mutex<Vmm>) -> std::result::Result<(), String> {
+    let devices = vmm.lock().unwrap().snapshottables()?;
+    for (id, device) in &devices {
+        device
+            .lock()
+            .unwrap()
+            .resume()
+            .map_err(|e| format!("device {id}: {e}"))?;
+    }
+    vmm.lock().unwrap().resume()
 }
 
 #[cfg(all(target_arch = "riscv64", target_os = "linux"))]

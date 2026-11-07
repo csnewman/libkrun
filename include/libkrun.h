@@ -506,7 +506,7 @@ typedef void (*krun_vmm_builder_shutdown_support_fn)(KrunVmmBuilder* handle, boo
  * The VM must be configured as the one the snapshot was taken of: the
  * same vCPUs, memory and payload, and the same devices in the same order.
  * Its devices may use other file descriptors and sockets. Supported on
- * Linux.
+ * Linux and macOS.
  */
 KrunResult krun_vmm_builder_restore(KrunVmmBuilder* handle, KrunStr dir, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_restore_fn)(KrunVmmBuilder* handle, KrunStr dir, KrunError* err_out);
@@ -548,7 +548,7 @@ typedef KrunResult (*krun_vmm_handle_resume_fn)(KrunVmmHandle handle, KrunError*
  * Pause the VM and write a snapshot of it into the directory `dir`, which
  * [`VmmBuilder::restore`] starts a VM from. The VM stays paused:
  * [`VmmHandle::resume`] carries on from where it was. Must not be called
- * from the thread running [`Vmm::run`]. Supported on Linux.
+ * from the thread running [`Vmm::run`]. Supported on Linux and macOS.
  */
 KrunResult krun_vmm_handle_snapshot(KrunVmmHandle handle, KrunStr dir, KrunError* err_out);
 typedef KrunResult (*krun_vmm_handle_snapshot_fn)(KrunVmmHandle handle, KrunStr dir, KrunError* err_out);
