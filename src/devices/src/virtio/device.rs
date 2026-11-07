@@ -52,6 +52,27 @@ pub(crate) enum InterruptType {
 
 pub(crate) trait InterruptHandler: Send + Sync {
     fn try_signal(&self, interrupt: InterruptType) -> Result<(), crate::Error>;
+
+    /// Signals used buffers on `queue`. Transports with an interrupt per queue
+    /// (MSI-X) raise that queue's; by default it is the device's interrupt.
+    fn try_signal_queue(&self, _queue: usize) -> Result<(), crate::Error> {
+        self.try_signal(InterruptType::UsedQueue)
+    }
+}
+
+/// A device's interrupts, with used buffers signalled on one queue.
+struct QueueInterrupt {
+    inner: Arc<dyn InterruptHandler>,
+    queue: usize,
+}
+
+impl InterruptHandler for QueueInterrupt {
+    fn try_signal(&self, interrupt: InterruptType) -> Result<(), crate::Error> {
+        match interrupt {
+            InterruptType::UsedQueue => self.inner.try_signal_queue(self.queue),
+            other => self.inner.try_signal(other),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -64,6 +85,15 @@ impl InterruptTransport {
 
     pub fn try_signal_used_queue(&self) -> Result<(), crate::Error> {
         self.0.try_signal(InterruptType::UsedQueue)
+    }
+
+    /// Returns these interrupts with used buffers signalled on `queue` only,
+    /// for devices that serve each queue separately.
+    pub fn for_queue(&self, queue: usize) -> Self {
+        Self(Arc::new(QueueInterrupt {
+            inner: self.0.clone(),
+            queue,
+        }))
     }
 
     pub fn try_signal_config_change(&self) -> Result<(), crate::Error> {

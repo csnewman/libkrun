@@ -79,6 +79,8 @@ use crate::vmm::vstate::MeasuredRegion;
 #[cfg(target_os = "macos")]
 use crate::vmm::vstate::map_guest_ram_in_blocks;
 use crate::vmm::vstate::{Error as VstateError, Vcpu, VcpuConfig, Vm};
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+use arch::aarch64::layout::KVM_LAST_SPI;
 use arch::{ArchMemoryInfo, InitrdConfig};
 use device_manager::shm::ShmManager;
 #[cfg(not(target_os = "windows"))]
@@ -232,9 +234,12 @@ pub enum StartMicrovmError {
     /// Cannot initialize a MMIO Vsock Device or add a device to the MMIO Bus.
     RegisterVsockDevice(device_manager::mmio::Error),
     /// Cannot register the PCI root or a virtio PCI function.
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(target_os = "linux", target_os = "windows")
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "linux", target_os = "windows")
+        ),
+        all(target_arch = "aarch64", target_os = "linux")
     ))]
     RegisterPciDevice(device_manager::pci::Error),
     /// PCI devices require ACPI discovery.
@@ -523,9 +528,12 @@ impl Display for StartMicrovmError {
                     "Cannot initialize a MMIO Vsock Device or add a device to the MMIO Bus. {err_msg}"
                 )
             }
-            #[cfg(all(
-                target_arch = "x86_64",
-                any(target_os = "linux", target_os = "windows")
+            #[cfg(any(
+                all(
+                    target_arch = "x86_64",
+                    any(target_os = "linux", target_os = "windows")
+                ),
+                all(target_arch = "aarch64", target_os = "linux")
             ))]
             RegisterPciDevice(ref err) => write!(f, "Cannot register PCI device: {err}"),
             #[cfg(all(
@@ -790,6 +798,9 @@ pub fn build_microvm(
         }
         enabled
     };
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    let pci_enabled = device_manager.uses_pci();
 
     let requirements = device_manager.requirements();
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -1147,14 +1158,23 @@ pub fn build_microvm(
     .map_err(StartMicrovmError::Internal)?;
 
     // Every device manager draws its interrupt lines from this one allocator,
-    // so that devices on different transports never share a line.
-    let irq_allocator = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX);
+    // so that devices on different transports never share a line. On aarch64
+    // KVM a line is an SPI, and the GIC has fewer of them than IRQ_MAX.
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    let irq_last = KVM_LAST_SPI;
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    let irq_last = arch::IRQ_MAX;
+    let irq_allocator = IrqAllocator::new(arch::IRQ_BASE, irq_last);
 
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(target_os = "linux", target_os = "windows")
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "linux", target_os = "windows")
+        ),
+        all(target_arch = "aarch64", target_os = "linux")
     ))]
-    let pci_device_manager = if pci_enabled {
+    #[allow(unused_mut)]
+    let mut pci_device_manager = if pci_enabled {
         Some(device_manager::pci::PciHostManager::new(
             irq_allocator.clone(),
         ))
@@ -1178,9 +1198,12 @@ pub fn build_microvm(
     let mut mmio_device_manager =
         MMIODeviceManager::new(&mut (arch::MMIO_MEM_START.clone()), irq_allocator);
 
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(target_os = "linux", target_os = "windows")
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "linux", target_os = "windows")
+        ),
+        all(target_arch = "aarch64", target_os = "linux")
     ))]
     if let Some(pci) = &pci_device_manager {
         pci.register_mmio(&mut mmio_device_manager.bus)
@@ -1209,6 +1232,12 @@ pub fn build_microvm(
             Box::new(KvmIoapic::new(vm.fd()).map_err(StartMicrovmError::CreateKvmIrqChip)?)
         };
         intc = Arc::new(Mutex::new(IrqChipDevice::new(ioapic)));
+
+        if !vm_resources.split_irqchip
+            && let Some(pci) = pci_device_manager.as_mut()
+        {
+            pci.enable_msi(vm.fd_shared());
+        }
 
         attach_legacy_devices(
             &vm,
@@ -1306,6 +1335,14 @@ pub fn build_microvm(
             Arc::new(Mutex::new(gic))
         };
 
+        // MSI-X goes through the GIC ITS. Without one (a GICv2 has none),
+        // PCI functions keep INTx.
+        if let Some(pci) = pci_device_manager.as_mut()
+            && let Err(e) = pci.enable_its(vm.fd_shared())
+        {
+            warn!("PCI functions will use INTx: {e}");
+        }
+
         attach_legacy_devices(
             &vm,
             &mut mmio_device_manager,
@@ -1396,9 +1433,12 @@ pub fn build_microvm(
         #[cfg(not(target_os = "windows"))]
         vm,
         mmio_device_manager,
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(target_os = "linux", target_os = "windows")
+        #[cfg(any(
+            all(
+                target_arch = "x86_64",
+                any(target_os = "linux", target_os = "windows")
+            ),
+            all(target_arch = "aarch64", target_os = "linux")
         ))]
         pci_device_manager,
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2776,9 +2816,12 @@ pub(crate) fn attach_mmio_device(
     Ok(())
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "linux", target_os = "windows")
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ),
+    all(target_arch = "aarch64", target_os = "linux")
 ))]
 pub(crate) fn attach_pci_device(
     vmm: &mut Vmm,
