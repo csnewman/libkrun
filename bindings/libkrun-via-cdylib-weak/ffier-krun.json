@@ -2924,6 +2924,29 @@
             "type": "Self"
           },
           "ffi_name": "krun_gpu_device_shm_size"
+        },
+        {
+          "name": "blob_alignment",
+          "doc": [
+            " Whether to offer the guest `VIRTIO_GPU_F_BLOB_ALIGNMENT`, asking it",
+            " to size blobs in host pages, which is the default. A guest whose pages",
+            " are as large as the host's doesn't need it, and Mesa's Venus driver",
+            " before 26.2 doesn't size its blobs to it, so it can't create an",
+            " instance when the feature is offered."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_gpu_device_blob_alignment"
         }
       ],
       "cfg": "feature = \"gpu\""

@@ -111,6 +111,11 @@ impl Gpu {
         self.export_table = Some(export_table);
     }
 
+    /// Leaves `VIRTIO_GPU_F_BLOB_ALIGNMENT` out of the features offered.
+    pub fn withhold_blob_alignment(&mut self) {
+        self.avail_features &= !(1 << uapi::VIRTIO_GPU_F_BLOB_ALIGNMENT);
+    }
+
     /*
     pub fn process_ctl(&mut self) -> bool {
         debug!("gpu: process_ctl()");
@@ -362,5 +367,22 @@ mod tests {
         gpu.read_config(16, &mut data);
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
         assert_eq!(u32::from_le_bytes(data), page_size);
+    }
+
+    #[test]
+    fn blob_alignment_withheld() {
+        let mut gpu = Gpu::new(
+            0,
+            Box::new([]),
+            NoopDisplayBackend::into_display_backend(None),
+            #[cfg(target_os = "macos")]
+            crossbeam_channel::unbounded().0,
+        )
+        .unwrap();
+        gpu.withhold_blob_alignment();
+        assert_eq!(
+            gpu.avail_features() & (1 << uapi::VIRTIO_GPU_F_BLOB_ALIGNMENT),
+            0
+        );
     }
 }
