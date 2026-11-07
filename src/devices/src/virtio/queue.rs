@@ -349,6 +349,10 @@ pub struct Queue {
     /// PCI queue memory accesses are allowed while the Command register's master bit is set.
     bus_master_gate: Option<Arc<AtomicBool>>,
 
+    /// Closed while a device is paused for a snapshot, for devices whose
+    /// threads reach the queue without the device stopping them.
+    snapshot_gate: Option<Arc<AtomicBool>>,
+
     /// The number of descriptor chains placed in the used ring via `add_used`
     /// since the last time `needs_notification` was called on the associated queue.
     num_added: Wrapping<u16>,
@@ -390,6 +394,7 @@ impl Queue {
             next_used: Wrapping(0),
             event_idx_enabled: false,
             bus_master_gate: None,
+            snapshot_gate: None,
             num_added: Wrapping(0),
         }
     }
@@ -398,10 +403,26 @@ impl Queue {
         self.bus_master_gate = Some(gate);
     }
 
+    /// While `gate` is false the queue doesn't touch guest memory: it has no
+    /// descriptors and takes no used ones.
+    pub(crate) fn set_snapshot_gate(&mut self, gate: Arc<AtomicBool>) {
+        self.snapshot_gate = Some(gate);
+    }
+
+    /// A copy of the queue's state, without its gates.
+    pub(crate) fn copy(&self) -> Queue {
+        let mut queue = Queue::new(self.max_size);
+        queue.restore(&self.snapshot());
+        queue
+    }
+
     fn bus_master_enabled(&self) -> bool {
-        self.bus_master_gate
-            .as_ref()
-            .is_none_or(|gate| gate.load(Ordering::Acquire))
+        [&self.bus_master_gate, &self.snapshot_gate]
+            .iter()
+            .all(|gate| {
+                gate.as_ref()
+                    .is_none_or(|gate| gate.load(Ordering::Acquire))
+            })
     }
 
     pub fn get_max_size(&self) -> u16 {

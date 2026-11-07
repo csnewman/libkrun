@@ -5,6 +5,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 use crate::Error as DeviceError;
+#[cfg(not(windows))]
+use crate::virtio::PauseError;
 use crate::virtio::net::Result;
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
@@ -13,8 +15,12 @@ use crate::virtio::{
     TYPE_NET, VirtioDevice,
 };
 
+#[cfg(not(windows))]
+use super::backend::NetBackend;
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
+#[cfg(not(windows))]
+use super::worker::NetWorkerHandle;
 
 #[cfg(windows)]
 use super::unixstream::Unixstream;
@@ -95,6 +101,15 @@ pub struct Net {
     worker_socket: Option<OwnedSocket>,
     #[cfg(windows)]
     worker: Option<NetWorker>,
+    #[cfg(not(windows))]
+    worker: Option<NetWorkerHandle>,
+    // A worker stopped for a snapshot, which resumes as it was.
+    #[cfg(not(windows))]
+    paused_worker: Option<NetWorker>,
+    /// The backend a reset left, which the next activation's worker runs on:
+    /// a socket or a tap device can't simply be connected to again.
+    #[cfg(not(windows))]
+    backend: Option<Box<dyn NetBackend + Send>>,
 }
 
 impl Net {
@@ -127,8 +142,11 @@ impl Net {
             config,
             #[cfg(windows)]
             worker_socket: None,
-            #[cfg(windows)]
             worker: None,
+            #[cfg(not(windows))]
+            paused_worker: None,
+            #[cfg(not(windows))]
+            backend: None,
         })
     }
 
@@ -242,16 +260,22 @@ impl VirtioDevice for Net {
 
         #[cfg(not(windows))]
         {
-            match NetWorker::new(
-                rx_q,
-                tx_q,
-                interrupt.clone(),
-                mem.clone(),
-                self.acked_features,
-                self.cfg_backend.clone(),
-            ) {
+            let worker = match self.backend.take() {
+                Some(backend) => {
+                    NetWorker::with_backend(rx_q, tx_q, interrupt.clone(), mem.clone(), backend)
+                }
+                None => NetWorker::new(
+                    rx_q,
+                    tx_q,
+                    interrupt.clone(),
+                    mem.clone(),
+                    self.acked_features,
+                    self.cfg_backend.clone(),
+                ),
+            };
+            match worker {
                 Ok(worker) => {
-                    worker.run();
+                    self.worker = Some(worker.run());
                     self.device_state = DeviceState::Activated(mem, interrupt);
                     Ok(())
                 }
@@ -270,17 +294,61 @@ impl VirtioDevice for Net {
         self.device_state.is_activated()
     }
 
+    #[cfg(not(windows))]
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        let worker = self
+            .worker
+            .take()
+            .ok_or_else(|| PauseError::Failed("virtio-net has no worker".into()))?
+            .stop()
+            .map_err(|e| PauseError::Failed(format!("virtio-net worker: {e:?}")))?;
+        let queues = worker.queues();
+        self.paused_worker = Some(worker);
+        Ok(queues)
+    }
+
+    /// Runs the worker stopped for a snapshot again, or on a device restored
+    /// from one, starts a worker on its new backend.
+    #[cfg(not(windows))]
+    fn resume(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        match self.paused_worker.take() {
+            Some(worker) => {
+                self.worker = Some(worker.run());
+                Ok(())
+            }
+            None => self.activate(mem, interrupt, queues),
+        }
+    }
+
     fn reset(&mut self) -> bool {
         #[cfg(windows)]
         {
             if let Some(worker) = self.worker.take() {
                 worker.stop();
             }
-            self.acked_features = 0;
-            self.device_state = DeviceState::Inactive;
-            true
         }
         #[cfg(not(windows))]
-        false
+        {
+            if let Some(worker) = self.worker.take() {
+                match worker.stop() {
+                    Ok(worker) => self.backend = Some(worker.into_backend()),
+                    Err(_) => {
+                        error!("virtio-net ({}) worker panicked", self.id());
+                        return false;
+                    }
+                }
+            }
+            if let Some(worker) = self.paused_worker.take() {
+                self.backend = Some(worker.into_backend());
+            }
+        }
+        self.acked_features = 0;
+        self.device_state = DeviceState::Inactive;
+        true
     }
 }
