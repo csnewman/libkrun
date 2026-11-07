@@ -12,8 +12,8 @@ use super::defs::{self, uapi::*};
 use super::{MemError, Result};
 use crate::virtio::descriptor_utils::{Reader, Writer};
 use crate::virtio::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
-    VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, PauseError,
+    QueueConfig, VirtioDevice,
 };
 
 pub(crate) const REQ_INDEX: usize = 0;
@@ -381,6 +381,38 @@ impl VirtioDevice for Mem {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    /// Event-loop driven, and `Vmm::snapshot` runs on that loop, so nothing of
+    /// ours is running — just hand the queue over.
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        Ok(self.queues.take().unwrap_or_default())
+    }
+
+    /// The requested size, then a byte for each block, 1 if it's plugged. The
+    /// plugged blocks' contents are in the snapshot's memory with the rest
+    /// of the guest's.
+    fn save_state(&self) -> Vec<u8> {
+        let mut state = self.config.requested_size.to_le_bytes().to_vec();
+        state.extend(self.plugged.iter().map(|&p| p as u8));
+        state
+    }
+
+    fn restore_state(&mut self, state: &[u8]) -> std::result::Result<(), crate::Error> {
+        let (requested, plugged) = state.split_at_checked(8).ok_or_else(|| {
+            crate::Error::Snapshot("virtio_mem: the snapshot's state is truncated".into())
+        })?;
+        if plugged.len() != self.plugged.len() {
+            return Err(crate::Error::Snapshot(format!(
+                "virtio_mem: snapshot has {} blocks, config has {}",
+                plugged.len(),
+                self.plugged.len()
+            )));
+        }
+        self.config.requested_size = u64::from_le_bytes(requested.try_into().unwrap());
+        self.plugged = plugged.iter().map(|&b| b != 0).collect();
+        self.config.plugged_size = self.plugged.iter().filter(|&&p| p).count() as u64 * BLOCK_SIZE;
+        Ok(())
     }
 
     fn reset(&mut self) -> bool {
