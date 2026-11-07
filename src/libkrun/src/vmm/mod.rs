@@ -52,9 +52,12 @@ use std::time::Duration;
 use utils::windows::AsRawFd;
 
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "linux", target_os = "windows")
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ),
+    all(target_arch = "aarch64", target_os = "linux")
 ))]
 use crate::vmm::device_manager::pci::PciHostManager;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -169,9 +172,12 @@ pub struct Vmm {
 
     // Guest VM devices.
     pub(crate) mmio_device_manager: MMIODeviceManager,
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(target_os = "linux", target_os = "windows")
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "linux", target_os = "windows")
+        ),
+        all(target_arch = "aarch64", target_os = "linux")
     ))]
     pub(crate) pci_device_manager: Option<PciHostManager>,
 
@@ -383,6 +389,13 @@ impl Vmm {
         #[cfg(target_arch = "aarch64")]
         {
             let vcpu_mpidr = vcpus.iter().map(|cpu| cpu.get_mpidr()).collect();
+            #[cfg(target_os = "linux")]
+            let pci = self
+                .pci_device_manager
+                .as_ref()
+                .map(PciHostManager::fdt_info);
+            #[cfg(not(target_os = "linux"))]
+            let pci = None;
             fdt::create_fdt(
                 &self.guest_memory,
                 &self.arch_memory_info,
@@ -391,6 +404,7 @@ impl Vmm {
                 self.mmio_device_manager.get_device_info(),
                 _intc,
                 initrd,
+                pci.as_ref(),
             )
             .map_err(Error::SetupFDT)?;
         }
