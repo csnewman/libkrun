@@ -54,6 +54,7 @@ hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
 lru = ">=0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
 rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = true }
 caps = "0.5.5"
 kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
