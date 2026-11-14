@@ -67,6 +67,11 @@ const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
 const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
 const VIRGLRENDERER_DRM: u32 = 1 << 10;
 
+// The offset of capability_bits in virglrenderer's struct virgl_caps_v2, and
+// VIRGL_CAP_ARB_BUFFER_STORAGE in it.
+const VIRGL_CAPS_V2_CAPABILITY_BITS: usize = 392;
+const VIRGL_CAP_ARB_BUFFER_STORAGE: u32 = 1 << 31;
+
 struct ExportTableLookup {
     table: ExportTable,
 }
@@ -223,6 +228,7 @@ pub struct VirtioGpu {
     pub(super) lost: Lost,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     blob_fds: BTreeMap<u32, (OwnedFd, u32)>,
+    surfaceless: bool,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
@@ -427,6 +433,7 @@ impl VirtioGpu {
             lost: Lost::default(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             blob_fds: BTreeMap::new(),
+            surfaceless: virgl_flags & VIRGLRENDERER_USE_SURFACELESS != 0,
             scanouts: Default::default(),
             displays,
             display_backend,
@@ -808,7 +815,10 @@ impl VirtioGpu {
 
     /// Gets a capset from rutabaga.
     pub fn get_capset(&self, capset_id: u32, version: u32) -> VirtioGpuResult {
-        let capset = self.rutabaga.get_capset(capset_id, version)?;
+        let mut capset = self.rutabaga.get_capset(capset_id, version)?;
+        if self.surfaceless && capset_id == rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2 {
+            withhold_buffer_storage(&mut capset);
+        }
         Ok(OkCapset(capset))
     }
 
@@ -1280,6 +1290,21 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
     base.checked_add(offset)
 }
 
+/// With ARB_buffer_storage, the guest's GL driver backs every persistently
+/// mapped buffer, its own staging buffers among them, with a blob it maps
+/// through the host visible region. A surfaceless renderer has no GBM device
+/// to export those GL buffers through, so every such map fails, and every
+/// readback the guest makes through one returns zeroes. Without the
+/// capability, the guest moves the same data with transfers.
+fn withhold_buffer_storage(caps: &mut [u8]) {
+    if let Some(bytes) =
+        caps.get_mut(VIRGL_CAPS_V2_CAPABILITY_BITS..VIRGL_CAPS_V2_CAPABILITY_BITS + 4)
+    {
+        let bits = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        bytes.copy_from_slice(&(bits & !VIRGL_CAP_ARB_BUFFER_STORAGE).to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
@@ -1304,6 +1329,24 @@ mod test {
         assert!(checked_blob_map_addr(base, wrapping_offset, size, shm).is_none());
 
         assert!(checked_blob_map_addr(u64::MAX - 5, 10, 0, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn withhold_buffer_storage_clears_only_its_bit() {
+        use super::{
+            VIRGL_CAP_ARB_BUFFER_STORAGE, VIRGL_CAPS_V2_CAPABILITY_BITS, withhold_buffer_storage,
+        };
+
+        let at = VIRGL_CAPS_V2_CAPABILITY_BITS;
+        let mut caps = vec![0xff_u8; at + 8];
+        withhold_buffer_storage(&mut caps);
+        let bits = u32::from_le_bytes(caps[at..at + 4].try_into().unwrap());
+        assert_eq!(bits, !VIRGL_CAP_ARB_BUFFER_STORAGE);
+        assert!(caps[..at].iter().chain(&caps[at + 4..]).all(|&b| b == 0xff));
+
+        let mut short = vec![0xff_u8; at];
+        withhold_buffer_storage(&mut short);
+        assert!(short.iter().all(|&b| b == 0xff));
     }
 
     #[test]
