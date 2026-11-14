@@ -193,15 +193,7 @@ impl NetWorker {
         if let Err(e) = self.rx_q.event.read() {
             log::error!("Failed to get rx event from queue: {e:?}");
         }
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by queue event)")
-        };
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
+        self.process_rx_loop();
     }
 
     fn process_tx_queue_event(&mut self) {
@@ -214,14 +206,32 @@ impl NetWorker {
     }
 
     fn process_backend_socket_readable(&mut self) {
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
-        };
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
+        self.process_rx_loop();
+    }
+
+    // A frame deferred for want of a descriptor is delivered only once the
+    // guest adds one and notifies us, so notifications must be left enabled
+    // after every pass. With VIRTIO_RING_F_EVENT_IDX, enabling them also
+    // moves avail_event up to the descriptors this pass consumed: left
+    // behind, the guest's next additions never cross it, it never notifies,
+    // and the backend socket, edge-triggered and already full, never wakes
+    // us either.
+    fn process_rx_loop(&mut self) {
+        loop {
+            if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
+                error!("error disabling queue notifications: {e:?}");
+            }
+            if let Err(e) = self.process_rx() {
+                log::error!("Failed to process rx: {e:?}");
+            }
+            match self.rx_q.queue.enable_notification(&self.mem) {
+                Ok(true) if self.rx_has_deferred_frame => {}
+                Ok(_) => break,
+                Err(e) => {
+                    error!("error enabling queue notifications: {e:?}");
+                    break;
+                }
+            }
         }
     }
 
