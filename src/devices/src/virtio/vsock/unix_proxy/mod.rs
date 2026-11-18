@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::Wrapping;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -45,6 +45,8 @@ pub struct UnixProxy {
     pub(crate) last_tx_cnt_sent: Wrapping<u32>,
     pub(crate) push_cnt: Wrapping<u32>,
     pub(crate) rx_cnt: Wrapping<u32>,
+    /// What the guest sent that the host socket has not taken yet.
+    pub(crate) unsent: VecDeque<u8>,
 }
 
 impl UnixProxy {
@@ -79,6 +81,7 @@ impl UnixProxy {
             last_tx_cnt_sent: Wrapping(0),
             push_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
+            unsent: VecDeque::new(),
         })
     }
 
@@ -113,6 +116,7 @@ impl UnixProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             path: Default::default(),
+            unsent: VecDeque::new(),
         }
     }
 
@@ -128,6 +132,16 @@ impl UnixProxy {
         };
 
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+    }
+
+    /// Ends a connection both sides have shut down.
+    pub(crate) fn close(&mut self) -> ProxyUpdate {
+        self.push_reset();
+        let mut update = sys::release(self);
+        self.status = ProxyStatus::Closed;
+        update.polling = Some((self.id, self.as_raw_fd(), EventSet::empty()));
+        update.signal_queue = true;
+        update
     }
 
     pub(crate) fn peer_avail_credit(&self) -> usize {
@@ -274,12 +288,16 @@ impl Proxy for UnixProxy {
             return ProxyUpdate::default();
         }
 
-        self.push_reset();
-        let mut update = self.release();
-        self.status = ProxyStatus::Closed;
-        update.polling = Some((self.id, self.as_raw_fd(), EventSet::empty()));
-        update.signal_queue = true;
-        update
+        // The guest closed with data the host has not taken yet: the
+        // connection closes once the host has it all.
+        if !self.unsent.is_empty() {
+            return ProxyUpdate {
+                polling: Some((self.id, self.as_raw_fd(), EventSet::OUT)),
+                ..Default::default()
+            };
+        }
+
+        self.close()
     }
 
     fn release(&mut self) -> ProxyUpdate {
