@@ -450,12 +450,10 @@ pub(crate) fn new_acceptor_proxy(
             .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?,
     )
     .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
-    listen(
-        &fd,
-        Backlog::new(5)
-            .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?,
-    )
-    .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
+    // The muxer accepts one connection per event, so a burst of clients
+    // waits in the backlog; any that overflow it are refused outright.
+    listen(&fd, Backlog::MAXCONN)
+        .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
     Ok(super::UnixAcceptorProxy { id, fd, peer_port })
 }
 
@@ -493,4 +491,32 @@ pub(crate) fn process_acceptor_event(
 
 pub(crate) fn as_raw_acceptor_fd(proxy: &super::UnixAcceptorProxy) -> RawFd {
     proxy.fd.as_raw_fd()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn socket_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("libkrun-vsock-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("sock")
+    }
+
+    #[test]
+    fn acceptor_holds_a_burst_of_connections() {
+        let path = socket_path("burst");
+        let _acceptor = new_acceptor_proxy(1, &path, 1024).unwrap();
+        let addr = UnixAddr::new(&path).unwrap();
+
+        let refused: Vec<Errno> = (0..64)
+            .map(|i| create_socket(i).unwrap())
+            .filter_map(|fd| connect(fd.as_raw_fd(), &addr).err())
+            .collect();
+
+        assert!(refused.is_empty(), "refused: {refused:?}");
+    }
 }
