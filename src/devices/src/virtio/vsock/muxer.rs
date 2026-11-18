@@ -674,12 +674,17 @@ impl VsockMuxer {
     fn process_op_shutdown(&self, pkt: &VsockPacket) {
         debug!("OP_SHUTDOWN");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        let update = self
-            .proxy_map
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|proxy| proxy.lock().unwrap().shutdown(pkt));
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            let mut proxy = proxy.lock().unwrap();
+            let mut update = proxy.shutdown(pkt);
+            // The muxer thread may write the connection's last data and
+            // close it as soon as the lock is released, so the polling
+            // change goes in first.
+            if let Some((id, fd, events)) = update.polling.take() {
+                self.update_polling(id, fd, events);
+            }
+            update
+        });
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }
